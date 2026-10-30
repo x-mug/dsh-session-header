@@ -61,9 +61,13 @@ dsh --patch ./my-overlay.yml
 | `header` | string | `x-session-id` | 注入的 header 名；线上大小写不敏感 |
 | `value` | string | — | 固定值；不设 = 取当前调用的 harness session id |
 | `toolEndpoints` | string[] | `[]` | 工具执行期匹配的 URL 前缀。非空时，`tools/execute` 瀑布内的 fetch（例如工具里调用的网关 web-search Messages API）仅当 URL 以某前缀开头才注入 header——第三方工具目标（web_fetch 抓任意网页、GitHub、MCP 服务器等）不受影响。前缀解析出的路径为 `/` 时等于放行整个 origin，该 origin 下所有路径都会带上 session id。默认空 = 保持原有仅 LLM 注入行为 |
+| `llmEndpointAllowlist` | string[] | `[]` | LLM 阶段允许注入的 URL 前缀。**空数组表示不限制**——与 `toolEndpoints` 相反（它为空等于关掉工具阶段）：空时 `llm/stream` 作用域内任何 fetch 都是候选，adapter 自身的内部请求因此能正常工作。非空时只有 URL 命中前缀才注入（与 `toolEndpoints` 相同的 origin 全等 + 路径边界规则）。建议开启限制。前缀路径写成 `/` 等于覆盖整个 origin（同域 OAuth token 端点也会命中），要排除就必须写具体路径前缀。每一项都必须是 http(s) URL：非法项会让配置在加载时被拒绝（不同于 `toolEndpoints`，那里非法项只会被丢弃、不影响加载）。 |
 | `overwriteHeaders` | string[] | `[]` | 必须包含本插件自己的 `header` 名（大小写不敏感）才允许替换该头已存在的值；列其它名字没有任何效果。未列出的头仍遵守"不覆盖"规则。某些官方 provider 会硬编码占位值（如 `dsh-web-search-deepseek` 发送 `x-opencode-session: dsh-web-search`），网关会当作缺失拒绝；要替换该占位值，需同时把该头设为本插件的 header，例如 `header: x-opencode-session` 配 `overwriteHeaders: [x-opencode-session]`，这样真实的会话 id 才会替换它。 |
+| `redirectGuard` | boolean | `false` | 开启后，本插件实际注入 header 的请求会带上 `redirect: 'error'`，避免 header 跟随重定向跳到别的 origin——fetch 跨源重定向会剥掉凭据，但不会剥掉自定义 header。仅当调用方通过 `init.redirect` 显式指定时保留其值；`Request` 形态下非默认的 `redirect`（如 `manual`）会保留，但默认的 `follow` 会被改成 `error`。默认关闭，不开启则不改变任何现有行为。 |
 
-配置在插件加载时校验一次。`header` 必须是运行时 `Headers` 接受的字段名，且不能是凭据、路由或分帧类 header（完整名单见 `index.js`）；`value` 一旦设置必须非空且是合法 header 值。校验不通过会先记日志再抛错，插件在插件列表里显示为失败，而不是加载成功却从不注入。唯一的软失败是 `toolEndpoints`：无法解析或非 http(s) 的前缀会被丢弃并告警。
+注意两个列表的空值语义相反：`toolEndpoints` 为空会关掉工具阶段注入，而 `llmEndpointAllowlist` 为空表示「不限制」——这是向后兼容的默认值，建议显式开启限制。前缀路径写成 `/` 等于覆盖整个 origin（同域的 OAuth token 端点也会命中），要排除就必须写具体路径前缀。`redirectGuard` 未开启时不改变任何行为；开启后也只作用于真正被注入、且调用方没有自行指定重定向策略的请求。
+
+配置在插件加载时校验一次。`header` 必须是运行时 `Headers` 接受的字段名，且不能是凭据、路由或分帧类 header（完整名单见 `index.js`）；`value` 一旦设置必须非空且是合法 header 值。校验不通过会先记日志再抛错，插件在插件列表里显示为失败，而不是加载成功却从不注入。唯一的软失败是 `toolEndpoints`：其中无法解析或非 http(s) 的前缀会被丢弃并告警。`llmEndpointAllowlist` 的每一项都在加载时校验，非法项会让配置被拒绝。
 
 ## 验证
 
