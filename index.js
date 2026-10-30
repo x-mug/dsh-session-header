@@ -43,7 +43,38 @@ export const name = 'dsh-session-header'
 // Hard dependency: nothing to do until the llm runtime exists.
 export const inject = ['llm']
 
+/**
+ * Session-header names the DSH/magpie ecosystem already uses for the identity
+ * this plugin carries. Seeing one of them on a request means someone else is
+ * already stamping the session, so this plugin stays out of the way.
+ */
+const DEFAULT_NATIVE_SESSION_HEADERS = [
+  'x-session-id',
+  'x-opencode-session',
+  'x-session-affinity',
+  'session_id',
+  'session-id',
+  'x-claude-code-session-id',
+  'x-conversation-id',
+  'x-deepseek-harness-session-id',
+]
+
 export const Config = Schema.object({
+  /**
+   * Master switch. `false` keeps the plugin configured — the schema still
+   * loads, so a settings surface can turn it back on — while installing
+   * nothing: no dispatcher hook and no listeners.
+   */
+  enabled: Schema.boolean().default(true),
+  /**
+   * Session-header names that mean "this request already carries the identity".
+   * A request holding any of them (case-insensitive) is left untouched and
+   * counted as a native skip. The default list covers the DSH/magpie ecosystem:
+   * x-session-id, x-opencode-session, x-session-affinity, session_id,
+   * session-id, x-claude-code-session-id, x-conversation-id and
+   * x-deepseek-harness-session-id.
+   */
+  nativeSessionHeaders: Schema.array(Schema.string()).default(DEFAULT_NATIVE_SESSION_HEADERS),
   /**
    * Header name to inject; HTTP field names are case-insensitive on the wire.
    * An invalid field name, or a credential/routing/framing header, rejects the
@@ -101,6 +132,15 @@ export const Config = Schema.object({
    * `error`.
    */
   redirectGuard: Schema.boolean().default(false),
+  /**
+   * Whether a native session header has ever been seen on a request. Written
+   * automatically by this plugin — once, when the first one shows up — so the
+   * client plugin can offer uninstalling this redundant plugin. Clearing it by
+   * hand makes the client prompt appear again; it is not a normal user switch.
+   * Volatile because it is written through the settings service, which only
+   * edits live fields.
+   */
+  nativeHeaderSeen: Schema.boolean().default(false).volatile().description('Written automatically when a native session header is detected; clearing it by hand makes the client prompt appear again.'),
 })
 
 /**
@@ -360,7 +400,7 @@ export function apply(ctx, config) {
   // The Schema above already filled the defaults (the harness validates plugin
   // config through it), so these are read once here rather than re-defaulted on
   // every injection.
-  const { header, value: fixedValue, llmEndpointAllowlist, toolEndpoints, overwriteHeaders, redirectGuard } = config
+  const { enabled, nativeSessionHeaders, header, value: fixedValue, llmEndpointAllowlist, toolEndpoints, overwriteHeaders, redirectGuard } = config
 
   // Fail closed BEFORE any global side effect: nothing is patched and no
   // listener is registered, so a rejected config cannot degrade requests. Log
@@ -371,6 +411,13 @@ export function apply(ctx, config) {
   if (problem !== undefined) {
     ctx.logger.error(`dsh-session-header: not installing — ${problem}`)
     throw new Error(`dsh-session-header: ${problem}`)
+  }
+
+  if (!enabled) {
+    // Configured but switched off: install nothing (no hook, no listener) while
+    // the schema stays loaded, so a settings surface can turn it back on.
+    ctx.logger.info?.('dsh-session-header: disabled by configuration (enabled: false); nothing installed')
+    return
   }
 
   const als = new AsyncLocalStorage()
@@ -439,18 +486,62 @@ export function apply(ctx, config) {
     return normalizeSessionId(id)
   }
 
+  // Detection counters, logged rather than exposed (the host has no status
+  // surface): the first event of each kind, then one line every 100 events.
+  const counters = { injected: 0, nativeSkipped: 0, fallback: 0 }
+  const counterSummary = () =>
+    `injected=${counters.injected} nativeSkipped=${counters.nativeSkipped} fallback=${counters.fallback}`
+  const noteCounters = (kind) => {
+    const total = counters.injected + counters.nativeSkipped + counters.fallback
+    if (counters[kind] === 1 || total % 100 === 0) {
+      ctx.logger.info?.(`dsh-session-header: ${counterSummary()}`)
+    }
+  }
+
+  // The host cannot show a dialog, so a native sighting is reported — once in
+  // the log, and once through settings where the client plugin reads it and
+  // offers to uninstall this redundant plugin.
+  let nativeReported = false
+  let nativeHeaderWriteAttempted = false
+  const noteNativeHeader = (name) => {
+    counters.nativeSkipped += 1
+    if (!nativeReported) {
+      nativeReported = true
+      ctx.logger.info?.(`dsh-session-header: native session header "${name}" detected; this plugin stops injecting — consider uninstalling it`)
+    }
+    if (!nativeHeaderWriteAttempted) {
+      // Exactly one attempt: a settings write must never repeat per request,
+      // and a failure must never reach the caller.
+      nativeHeaderWriteAttempted = true
+      const recordFailure = (error) => {
+        ctx.logger.warn?.(`dsh-session-header: could not record nativeHeaderSeen in settings: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      try {
+        const settings = ctx.get?.('settings')
+        const namespace = ctx.fiber?.entry?.options.id
+        if (typeof settings?.update === 'function' && typeof namespace === 'string') {
+          // Fire and forget. expectedRevision stays undefined = no CAS, so the
+          // write also succeeds when another surface changed this entry.
+          Promise.resolve(settings.update(namespace, { nativeHeaderSeen: true }, undefined)).catch(recordFailure)
+        }
+      } catch (error) {
+        recordFailure(error)
+      }
+    }
+    noteCounters('nativeSkipped')
+  }
+
   // One warning per distinct internal failure. A failure mode repeats on every
   // request, so logging per request would bury everything else; the cap keeps
   // an adversarial stream of novel messages from growing the set forever.
   const reportedFallbacks = new Set()
-  let fallbackFailures = 0
   const reportFallback = (error) => {
-    fallbackFailures += 1
+    counters.fallback += 1
     const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
     const signature = detail.slice(0, 200)
     if (reportedFallbacks.size >= 32 || reportedFallbacks.has(signature)) return
     reportedFallbacks.add(signature)
-    ctx.logger.warn(`dsh-session-header: not injecting this request after an internal error (${signature}; ${fallbackFailures} failure(s) so far)`)
+    ctx.logger.warn(`dsh-session-header: not injecting this request after an internal error (${signature}; ${counters.fallback} failure(s) so far)`)
   }
 
   // Redirection policy: only rewrite a request the operator opted into
@@ -486,6 +577,20 @@ export function apply(ctx, config) {
       if (init?.headers !== undefined) {
         for (const [key, value] of new Headers(init.headers)) headers.set(key, value)
       }
+      // Someone else already carries the identity: leave the request alone and
+      // record the sighting. Our own header name NEVER counts as native,
+      // independent of `overwriteHeaders`: a second instance of this plugin
+      // (HMR, a duplicate row) injects exactly this name, and reading its value
+      // as "someone else already did it" would leave that instance permanently
+      // stood down and claim this plugin is redundant.
+      const ownHeader = header.toLowerCase()
+      const nativeHeader = nativeSessionHeaders.find(
+        (name) => name.toLowerCase() !== ownHeader && headers.has(name),
+      )
+      if (nativeHeader !== undefined) {
+        noteNativeHeader(nativeHeader)
+        return undefined
+      }
       // Inject only when absent — unless `overwriteHeaders` lists our header, in
       // which case the live session id replaces whatever placeholder value
       // another layer (an official provider) hard-coded.
@@ -501,8 +606,13 @@ export function apply(ctx, config) {
         // which may be reused by the caller — keeps arriving providers without
         // us. The rebuild fails when the body was already consumed: say so
         // (rate-limited) and let the caller's own call through unmodified.
-        return { input: new Request(input, { headers, ...extra }) }
+        const nextInput = new Request(input, { headers, ...extra })
+        counters.injected += 1
+        noteCounters('injected')
+        return { input: nextInput }
       }
+      counters.injected += 1
+      noteCounters('injected')
       return { init: { ...init, headers, ...extra } }
     } catch (error) {
       reportFallback(error)
@@ -515,7 +625,23 @@ export function apply(ctx, config) {
   // dispose delete the other copy's hook. The Map's insertion order (not the
   // id) is what fixes hook execution order.
   const hookId = randomUUID()
-  register(hookId, inject, ctx.logger)
+  try {
+    register(hookId, inject, ctx.logger)
+  } catch (error) {
+    // A fetch patch that failed to install would leave the plugin looking
+    // healthy while injecting nothing, which the loader must never miss.
+    ctx.logger.error(`dsh-session-header: could not install the fetch dispatcher hook: ${error instanceof Error ? error.message : String(error)}`)
+    throw error
+  }
+  // Mount self-check: the hook must actually be in the shared registry. A
+  // silently ignored registration is the same dead-plugin failure as a throw,
+  // so fail loudly instead of pretending to be installed.
+  const mountedRegistry = globalThis[DISPATCHER_KEY]
+  if (mountedRegistry === undefined || !mountedRegistry.hooks.has(hookId)) {
+    const message = 'dsh-session-header: the fetch dispatcher hook did not register'
+    ctx.logger.error(message)
+    throw new Error(message)
+  }
   // cordis `ctx.effect`: the callback runs IMMEDIATELY (setup); its RETURN VALUE
   // is the disposer collected for fiber unload, so unloading removes this
   // instance's hook — and restores the original fetch only when this was the
