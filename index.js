@@ -26,12 +26,16 @@
  * harness path produced it. Calls with neither a configured value nor a
  * session id get no header. A header anyone else already set is never overwritten
  * (`Headers` matching is case-insensitive, the same rule the wire uses).
- * Unloading the plugin restores the original fetch.
+ * The fetch patch is one shared dispatcher registered on `globalThis` under a
+ * stable Symbol: several instances (or an HMR re-apply) share a single wrapper
+ * layer, and unloading removes only that instance's hook — the original fetch
+ * comes back once the last hook is gone and nothing else wrapped us.
  *
  * @module dsh-session-header
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'dsh-session-header'
@@ -227,6 +231,126 @@ function configDiagnostic(header, value, llmEndpointAllowlist) {
 }
 
 /**
+ * Key of the shared fetch dispatcher registry on `globalThis`. `Symbol.for`
+ * survives module duplication — two copies of this package (HMR, a linked
+ * checkout) must find the same registry — and the `@1` suffix lets a future
+ * incompatible dispatcher format coexist instead of misreading this shape.
+ */
+const DISPATCHER_KEY = Symbol.for('dsh-session-header#fetch-dispatcher@1')
+
+/**
+ * The registry on `globalThis` holds only `{ dispatcher, hooks }`. The captured
+ * original fetch stays in this module's closure and is never read back out of
+ * the registry.
+ */
+let capturedOriginalFetch
+let warnedOrphan = false
+let isolatedFailures = 0
+const isolatedSignatures = new Set()
+let dispatchWarn
+
+
+/**
+ * Register one hook in the shared dispatch layer, creating the layer only when
+ * it is absent. An existing registry gains a hook and nothing else: `register`
+ * never installs a second wrapper, so repeated loads (HMR, two instances) cannot
+ * deepen the chain.
+ *
+ * Hook contract: `(input, init) => { input?, init? } | undefined`.
+ *
+ * - A hook must NOT read or consume `input.body`. It may replace the whole
+ *   `input` (e.g. rebuild a `Request` carrying extra headers — which already
+ *   fails once the body was used) or layer values onto `init`.
+ * - Returning nothing (or undefined) means "pass the call through untouched".
+ * - Hooks run in registration order against the progressively updated call.
+ *   Each hook here injects only when the header is absent, so the first
+ *   registrant wins unless it was configured to overwrite.
+ * - A hook that throws is skipped for that request: the dispatcher isolates it
+ *   (later hooks and the request itself continue) and reports it once per
+ *   distinct signature, rate-limited like the injection failures.
+ * @param {string} id - this registration's unique id, used to remove it later.
+ * @param {function} hook - the hook described above.
+ * @param {{ warn: function }} [logger] - sink for dispatcher-level diagnostics.
+ * @returns {function} the dispatcher installed for this registry.
+ */
+export function register(id, hook, logger) {
+  let registry = globalThis[DISPATCHER_KEY]
+  if (registry === undefined) {
+    const originalFetch = globalThis.fetch
+    capturedOriginalFetch = originalFetch
+    const hooks = new Map()
+    const dispatcher = (input, init) => {
+      let currentInput = input
+      let currentInit = init
+      for (const registered of hooks.values()) {
+        let next
+        try {
+          next = registered(currentInput, currentInit)
+        } catch (error) {
+          // Isolate the failing hook: it cannot skip later hooks, change the
+          // request, or turn its own bug into the caller's failure.
+          isolatedFailures += 1
+          const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+          const signature = detail.slice(0, 200)
+          if (isolatedSignatures.size < 32 && !isolatedSignatures.has(signature)) {
+            isolatedSignatures.add(signature)
+            dispatchWarn?.(`dsh-session-header: skipped a failing fetch hook (${signature}; ${isolatedFailures} isolated failure(s) so far)`)
+          }
+          continue
+        }
+        if (next !== null && typeof next === 'object') {
+          if ('input' in next) currentInput = next.input
+          if ('init' in next) currentInit = next.init
+        }
+      }
+      return originalFetch(currentInput, currentInit)
+    }
+    registry = { dispatcher, hooks }
+    globalThis[DISPATCHER_KEY] = registry
+    globalThis.fetch = dispatcher
+  }
+  // The dispatcher is shared, so its diagnostics go to the most recent
+  // registrant's logger (typically the instance whose hook is being called).
+  if (typeof logger?.warn === 'function') dispatchWarn = logger.warn.bind(logger)
+  registry.hooks.set(id, hook)
+  return registry.dispatcher
+}
+
+/**
+ * Remove one hook. Idempotent: removing an id that is already gone — including a
+ * second dispose of the same instance — does nothing and warns nothing.
+ *
+ * When the last hook goes, restore the captured fetch only if our dispatcher is
+ * still the installed one: a patch applied after ours sits in front of it, so
+ * restoring would silently drop that patch. In that case the now-inert
+ * dispatcher stays in the chain (no hooks ⇒ pure passthrough) and the operator
+ * is told once.
+ * @param {string} id - the registration id handed to {@link register}.
+ * @param {{ warn: function }} [logger] - sink for the one orphan warning.
+ */
+export function unregister(id, logger) {
+  const registry = globalThis[DISPATCHER_KEY]
+  if (registry === undefined) return
+  if (!registry.hooks.delete(id)) return
+  if (registry.hooks.size > 0) return
+  if (globalThis.fetch !== registry.dispatcher) {
+    if (warnedOrphan) return
+    warnedOrphan = true
+    logger?.warn?.('dsh-session-header: global fetch was wrapped after this plugin loaded; leaving that wrapper in place (the plugin now passes every call through)')
+    return
+  }
+  if (capturedOriginalFetch === undefined) {
+    // Only the module copy that created this registry holds the original fetch.
+    if (warnedOrphan) return
+    warnedOrphan = true
+    logger?.warn?.('dsh-session-header: cannot restore the original fetch from this module copy; leaving the dispatcher inert (pure passthrough)')
+    return
+  }
+  globalThis.fetch = capturedOriginalFetch
+  delete globalThis[DISPATCHER_KEY]
+}
+
+/**
  * Plugin entry. `config.header` names the header, `config.value` optionally
  * fixes its value; per call, the AsyncLocalStorage store carries the resolved
  * value (plus the tool-phase gate), and a present store marks "this is an LLM
@@ -250,7 +374,6 @@ export function apply(ctx, config) {
   }
 
   const als = new AsyncLocalStorage()
-  const originalFetch = globalThis.fetch
   // Only one question is ever asked of `overwriteHeaders`: may we replace OUR
   // header? Case-insensitive match, the same rule the wire uses.
   const mayOverwrite = overwriteHeaders.some((name) => name.toLowerCase() === header.toLowerCase())
@@ -320,12 +443,14 @@ export function apply(ctx, config) {
   // request, so logging per request would bury everything else; the cap keeps
   // an adversarial stream of novel messages from growing the set forever.
   const reportedFallbacks = new Set()
+  let fallbackFailures = 0
   const reportFallback = (error) => {
+    fallbackFailures += 1
     const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
     const signature = detail.slice(0, 200)
     if (reportedFallbacks.size >= 32 || reportedFallbacks.has(signature)) return
     reportedFallbacks.add(signature)
-    ctx.logger.warn(`dsh-session-header: not injecting this request after an internal error (${signature})`)
+    ctx.logger.warn(`dsh-session-header: not injecting this request after an internal error (${signature}; ${fallbackFailures} failure(s) so far)`)
   }
 
   // Redirection policy: only rewrite a request the operator opted into
@@ -336,76 +461,66 @@ export function apply(ctx, config) {
     return 'error'
   }
 
-  const patchedFetch = (input, init) => {
-    // Only the plugin's own work runs inside this try: the upstream call is
-    // made after it succeeds, so a plugin bug falls back to the untouched
-    // request instead of retrying — or swallowing — someone else's fetch.
-    let target = input
-    let overrides = init
+  // The injection itself is one dispatcher hook: it returns the arguments the
+  // dispatcher should forward (or undefined to forward the caller's own
+  // untouched), and the shared dispatcher calls the real fetch only after every
+  // hook has run.
+  const inject = (input, init) => {
+    // Only the plugin's own work runs inside this try; returning undefined lets
+    // the dispatcher forward the caller's own arguments, so a plugin bug can
+    // never change — or re-issue — someone else's request.
     try {
       const injection = als.getStore()
       // No store, no value, or a fetch outside this phase's whitelist: pass the
       // caller's own arguments through untouched.
       if (
-        injection !== undefined &&
-        injection.value !== undefined &&
-        (injection.matchers === null || matchesEndpoint(injection.matchers, input))
+        injection === undefined ||
+        injection.value === undefined ||
+        (injection.matchers !== null && !matchesEndpoint(injection.matchers, input))
       ) {
-        // Collect headers from both fetch() spellings: a Request object carries
-        // its own, and init.headers overrides them per the fetch standard.
-        const headers = new Headers(input instanceof Request ? input.headers : undefined)
-        if (init?.headers !== undefined) {
-          for (const [key, value] of new Headers(init.headers)) headers.set(key, value)
-        }
-        // Inject only when absent — unless `overwriteHeaders` lists our header,
-        // in which case the live session id replaces whatever placeholder value
-        // another layer (an official provider) hard-coded.
-        if (!headers.has(header) || mayOverwrite) {
-          headers.set(header, injection.value)
-          // Optional guard: fetch strips credentials on a cross-origin redirect
-          // but would carry this header to the new origin, so a guarded request
-          // refuses to follow one. Applied in BOTH call shapes and only when
-          // `redirectGuard` is on and the caller pinned no redirect of its own.
-          const extra = redirectGuard ? { redirect: guardedRedirect(input, init) } : {}
-          if (input instanceof Request && init === undefined) {
-            // A bare Request input owns its headers; rebuild it so the original
-            // — which may be reused by the caller — keeps arriving providers
-            // without us. The rebuild fails when the body was already consumed:
-            // say so (rate-limited) and hand the caller's own call through
-            // rather than injecting a header nobody can send.
-            try {
-              target = new Request(input, { headers, ...extra })
-              overrides = undefined
-            } catch (error) {
-              reportFallback(error)
-              return originalFetch(input, init)
-            }
-          } else {
-            overrides = { ...init, headers, ...extra }
-          }
-        }
+        return undefined
       }
+      // Collect headers from both fetch() spellings: a Request object carries
+      // its own, and init.headers overrides them per the fetch standard.
+      const headers = new Headers(input instanceof Request ? input.headers : undefined)
+      if (init?.headers !== undefined) {
+        for (const [key, value] of new Headers(init.headers)) headers.set(key, value)
+      }
+      // Inject only when absent — unless `overwriteHeaders` lists our header, in
+      // which case the live session id replaces whatever placeholder value
+      // another layer (an official provider) hard-coded.
+      if (headers.has(header) && !mayOverwrite) return undefined
+      headers.set(header, injection.value)
+      // Optional guard: fetch strips credentials on a cross-origin redirect but
+      // would carry this header to the new origin, so a guarded request refuses
+      // to follow one. Applied in BOTH call shapes and only when `redirectGuard`
+      // is on and the caller pinned no redirect of its own.
+      const extra = redirectGuard ? { redirect: guardedRedirect(input, init) } : {}
+      if (input instanceof Request && init === undefined) {
+        // A bare Request input owns its headers; rebuild it so the original —
+        // which may be reused by the caller — keeps arriving providers without
+        // us. The rebuild fails when the body was already consumed: say so
+        // (rate-limited) and let the caller's own call through unmodified.
+        return { input: new Request(input, { headers, ...extra }) }
+      }
+      return { init: { ...init, headers, ...extra } }
     } catch (error) {
       reportFallback(error)
-      return originalFetch(input, init)
+      return undefined
     }
-    return originalFetch(target, overrides)
   }
 
-  globalThis.fetch = patchedFetch
-  // cordis `ctx.effect`: the callback runs IMMEDIATELY (setup); its RETURN
-  // VALUE is the disposer collected for fiber unload. v0.1.0 ran the restore
-  // in the callback body — undoing the patch in the same tick — so the fix
-  // returns the restore as the disposer.
-  ctx.effect(() => () => {
-    if (globalThis.fetch === patchedFetch) {
-      globalThis.fetch = originalFetch
-    } else {
-      // Someone else replaced fetch after we loaded; their patch fronts ours,
-      // so restoring ours would silently drop theirs.
-      ctx.logger.warn('dsh-session-header: global fetch was replaced after load; not restoring')
-    }
-  })
+  // A random id, not a per-module counter: two module copies of this package
+  // each start a counter at zero, and a colliding id would let one copy's
+  // dispose delete the other copy's hook. The Map's insertion order (not the
+  // id) is what fixes hook execution order.
+  const hookId = randomUUID()
+  register(hookId, inject, ctx.logger)
+  // cordis `ctx.effect`: the callback runs IMMEDIATELY (setup); its RETURN VALUE
+  // is the disposer collected for fiber unload, so unloading removes this
+  // instance's hook — and restores the original fetch only when this was the
+  // last hook and nothing wrapped our dispatcher.
+  ctx.effect(() => () => unregister(hookId, ctx.logger))
 
   ctx.on('llm/stream', async function* (options, next) {
     const inner = next()
