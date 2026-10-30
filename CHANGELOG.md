@@ -5,6 +5,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 Forked from [`homily707/dsh-session-header`](https://github.com/homily707/dsh-session-header) at `79a96e6` (0.2.1).
 
+## [0.4.2] - 2026-10-30
+
+### Changed
+
+- The wire value keeps DSH's `session-` branding: every UUID-shaped session id
+  now goes out as `session-<lowercase-uuid>` (both an `<agentId>-session-<uuid>`
+  id and a bare UUID map onto it). This is the same id DSH writes into its own
+  session logs, so a gateway that reads those logs can link a request to its
+  session and show the session title. Non-UUID ids keep their text after losing a
+  leading `session-` prefix.
+
 ## [0.4.1] - 2026-10-30
 
 ### Added

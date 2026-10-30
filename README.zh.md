@@ -19,7 +19,7 @@ harness 没有请求级 header 缝——`GenerateOptions` 没有 headers 字段�
 
 取值语义：
 
-- 默认：取当前调用 `GenerateOptions.sessionId`，发送前先归一：形如 `<agentId>-session-<uuid>` 的取其中的 UUID，其余只剥掉开头的 `session-` 前缀——因此持久化 `session-<uuid>` 发出纯 UUID，配置型 agent 也发出同一个 UUID，而不是它的 `<agentId>-session-<uuid>` 形态；主会话各轮次、压缩/起标题辅助调用、in-process 子 agent 各自上报**自己的** session id（子 agent 拥有独立的 child session id）；工具执行期（`tools/execute`）改取 `exec.agent.id`（正在运行该工具的 agent），同样做归一；
+- 默认：取当前调用 `GenerateOptions.sessionId`，发送前先归一：所有 UUID 形态的 id 统一成带前缀的 `session-<小写 uuid>`——`<agentId>-session-<uuid>` 与裸 UUID 都映射到它——因此这个值与 DSH 写进会话日志的 session id 一致，读日志的网关可以把请求关联到会话；非 UUID 的 id 只剥掉开头的 `session-` 前缀、保留原文；主会话各轮次、压缩/起标题辅助调用、in-process 子 agent 各自上报**自己的** session id（子 agent 拥有独立的 child session id）；工具执行期（`tools/execute`）改取 `exec.agent.id`（正在运行该工具的 agent），同样做归一；
 - 配置 `value`：所有调用使用固定值（按配置原样发送，不剥前缀）；
 - 两者皆无的调用不发这个 header。
 
@@ -30,7 +30,7 @@ harness 没有请求级 header 缝——`GenerateOptions` 没有 headers 字段�
 ### 作为 bundle 安装（推荐）
 
 ```sh
-dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.0
+dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.2
 ```
 
 本包是纯 JavaScript、无构建脚本，不需要 pnpm ≥ 10 的构建授权。要获得可复现的安装，请锁定 tag 或 commit（`github:x-mug/dsh-session-header#<tag-or-sha>`）。验证层并启动：

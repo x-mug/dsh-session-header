@@ -158,15 +158,18 @@ const UUID_ONLY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  * Normalize one harness session id into the value sent on the wire.
  *
  * - `<prefix>-session-<uuid>` (a configurable agent's id, ending in a
- *   canonical UUID) becomes that UUID;
- * - any other id starting with `session-` becomes the id without that prefix;
- * - everything else is returned unchanged;
+ *   canonical UUID) becomes `session-<uuid>`;
+ * - any other id starting with `session-` loses that prefix, and a UUID-shaped
+ *   result is put back as `session-<uuid>` — one branded, lowercase spelling
+ *   for every session, matching the id DSH writes into its session logs;
+ * - a bare UUID becomes `session-<uuid>`;
+ * - everything else is returned unchanged (a non-UUID id keeps no prefix);
  * - `undefined` stays `undefined`, which means "no session to report".
  *
- * A bare UUID is lowercased: UUIDs compare case-insensitively, so the same
- * session must not reach the wire in two spellings. Any other value keeps its
- * own casing. Only the trailing `-session-<uuid>` shape is unwrapped, so an id
- * that merely contains "session" (or `session-` mid-string) is never truncated.
+ * UUIDs are lowercased: they compare case-insensitively, so the same session
+ * must not reach the wire in two spellings. Only the trailing
+ * `-session-<uuid>` shape is unwrapped, so an id that merely contains
+ * "session" (or `session-` mid-string) is never truncated.
  * @param {unknown} id - the raw id the harness reported.
  * @returns {string | undefined} the value to send for this id.
  */
@@ -175,7 +178,10 @@ export function normalizeSessionId(id) {
   const text = String(id)
   const agentForm = AGENT_SESSION_ID.exec(text)
   const bare = agentForm !== null ? agentForm[1] : text.replace(/^session-/, '')
-  return UUID_ONLY.test(bare) ? bare.toLowerCase() : bare
+  // Keep the harness's own `session-` branding on UUID-shaped ids: the same
+  // value is what DSH writes into its session logs, so a gateway that matches
+  // requests against those logs by id can link them.
+  return UUID_ONLY.test(bare) ? `session-${bare.toLowerCase()}` : bare
 }
 
 /**

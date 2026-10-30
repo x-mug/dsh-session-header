@@ -19,7 +19,7 @@ Context propagation uses `AsyncLocalStorage`. With the default empty `toolEndpoi
 
 Semantics of the value:
 
-- default: `GenerateOptions.sessionId` of the call in flight, normalized before it goes on the wire: an `<agentId>-session-<uuid>` id yields that UUID, and any other id only loses a leading `session-` prefix — so a persistent `session-<uuid>` sends a bare UUID, and a configurable agent reports that same UUID instead of its `<agentId>-session-<uuid>` spelling; main-session turns, compaction/title helper calls, and in-process subagent children each report **their own** session id (subagents get their own child session ids); inside a `tools/execute` call the id comes from `exec.agent.id` (the agent running the tool) and is normalized the same way;
+- default: `GenerateOptions.sessionId` of the call in flight, normalized before it goes on the wire: every UUID-shaped id becomes the same branded `session-<lowercase-uuid>` — an `<agentId>-session-<uuid>` id and a bare UUID both map onto it — so the value matches the session id DSH writes into its own session logs, which lets a gateway that reads those logs link the request to the session; a non-UUID id keeps its own text after losing a leading `session-` prefix; main-session turns, compaction/title helper calls, and in-process subagent children each report **their own** session id (subagents get their own child session ids); inside a `tools/execute` call the id comes from `exec.agent.id` (the agent running the tool) and is normalized the same way;
 - `value` config: a fixed value for every call instead (sent verbatim, no prefix stripping);
 - calls with neither get no header.
 
@@ -30,7 +30,7 @@ Requires the `dsh` CLI and Node ≥ 22.
 ### As a bundle (recommended)
 
 ```sh
-dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.0
+dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.2
 ```
 
 This package is plain JavaScript with no build scripts, so the pnpm ≥ 10 build allowance is not needed. For a reproducible install, pin a tag or commit (`github:x-mug/dsh-session-header#<tag-or-sha>`). Verify the layer and boot:

@@ -359,22 +359,23 @@ test('tools/execute: case-insensitive overwrite of a placeholder header', async 
 
 const UUID = '7f3e9a52-1b6c-4d8e-9f01-23456789abcd'
 const UPPER_UUID = '7F3E9A52-1B6C-4D8E-9F01-23456789ABCD'
+const WIRE = `session-${UUID}`
 
 test('normalizeSessionId: every harness id shape maps onto one wire value', () => {
   // Persistent sessions report `session-<uuid>`.
-  assert.equal(normalizeSessionId(`session-${UUID}`), UUID)
+  assert.equal(normalizeSessionId(`session-${UUID}`), WIRE)
   // An id minted without an explicit name is `session-<n>`: only the prefix goes.
   assert.equal(normalizeSessionId('session-42'), '42')
   // Configurable agents report `<agentId>-session-<uuid>`: the UUID is the identity.
-  assert.equal(normalizeSessionId(`agent-alpha-session-${UUID}`), UUID)
-  assert.equal(normalizeSessionId(`sub-agent-2-session-${UUID}`), UUID)
+  assert.equal(normalizeSessionId(`agent-alpha-session-${UUID}`), WIRE)
+  assert.equal(normalizeSessionId(`sub-agent-2-session-${UUID}`), WIRE)
   // A UUID is case-insensitive, so every spelling normalizes to lower case.
-  assert.equal(normalizeSessionId(`agent-alpha-session-${UPPER_UUID}`), UUID)
-  assert.equal(normalizeSessionId(`session-${UPPER_UUID}`), UUID)
+  assert.equal(normalizeSessionId(`agent-alpha-session-${UPPER_UUID}`), WIRE)
+  assert.equal(normalizeSessionId(`session-${UPPER_UUID}`), WIRE)
   // The tail match is case-insensitive end to end, separator included.
-  assert.equal(normalizeSessionId(`agent-alpha-SESSION-${UUID}`), UUID)
-  // A bare UUID passes through.
-  assert.equal(normalizeSessionId(UUID), UUID)
+  assert.equal(normalizeSessionId(`agent-alpha-SESSION-${UUID}`), WIRE)
+  // A bare UUID gains the same branding as every other shape.
+  assert.equal(normalizeSessionId(UUID), WIRE)
   // Conservative: only a trailing `-session-<uuid>` is unwrapped.
   assert.equal(normalizeSessionId('agent-session-not-a-uuid'), 'agent-session-not-a-uuid')
   assert.equal(normalizeSessionId('prefix-session-abc'), 'prefix-session-abc')
@@ -386,7 +387,7 @@ test('normalizeSessionId: every harness id shape maps onto one wire value', () =
   assert.equal(normalizeSessionId(undefined), undefined)
 })
 
-test('llm/stream: agent-form id is normalized to the bare UUID', async (t) => {
+test('llm/stream: agent-form id is normalized to the branded session id', async (t) => {
   const { handlers, recorder } = boot(t, { header: 'x-session-id' })
   async function* inner() {
     await fetch('https://llm.example.com/v1/chat/completions')
@@ -395,7 +396,7 @@ test('llm/stream: agent-form id is normalized to the bare UUID', async (t) => {
   const gen = handlers.get('llm/stream')({ sessionId: `agent-alpha-session-${UUID}` }, () => inner())
   for await (const _ of gen) { /* drain */ }
   assert.equal(recorder.calls.length, 1)
-  assert.equal(recorder.calls[0].headers.get('x-session-id'), UUID)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), WIRE)
 })
 
 test('llm/stream: a call without a session id gets no header', async (t) => {
@@ -433,7 +434,7 @@ test('tools/execute: agent-form id is normalized the same way', async (t) => {
   }
   await handlers.get('tools/execute')(exec, next)
   assert.equal(recorder.calls.length, 1)
-  assert.equal(recorder.calls[0].headers.get('x-opencode-session'), UUID)
+  assert.equal(recorder.calls[0].headers.get('x-opencode-session'), WIRE)
 })
 
 test('tools/execute: uppercase UUID tail is lowercased', async (t) => {
@@ -447,7 +448,7 @@ test('tools/execute: uppercase UUID tail is lowercased', async (t) => {
   }
   await handlers.get('tools/execute')(exec, next)
   assert.equal(recorder.calls.length, 1)
-  assert.equal(recorder.calls[0].headers.get('x-opencode-session'), UUID)
+  assert.equal(recorder.calls[0].headers.get('x-opencode-session'), WIRE)
 })
 
 test('tools/execute: non-UUID agent id with a -session- tail is not truncated', async (t) => {
