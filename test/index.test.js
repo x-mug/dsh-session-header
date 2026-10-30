@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apply, Config, normalizeSessionId } from '../index.js'
+import { apply, Config, normalizeSessionId, register, unregister } from '../index.js'
 
 /** Record every fetch the plugin (and the code under test) performs. */
 function installFetchRecorder() {
@@ -51,6 +51,13 @@ function makeContext() {
       disposers.push(fn())
     },
   }
+  return { ctx, handlers, disposers, errors, warnings }
+}
+
+/** Apply one plugin instance against the fetch already installed (no recorder). */
+function bootInstance(config = {}) {
+  const { ctx, handlers, disposers, errors, warnings } = makeContext()
+  apply(ctx, Config(config))
   return { ctx, handlers, disposers, errors, warnings }
 }
 
@@ -818,3 +825,190 @@ test('apply: invalid toolEndpoints entries only warn (soft failure)', async (t) 
   assert.equal(handlers.has('tools/execute'), true)
 })
 
+// --- shared singleton dispatcher: one wrapper layer, idempotent unload ---
+
+test('dispatcher: two instances share one layer and both hooks inject', async () => {
+  const recorder = installFetchRecorder()
+  const first = bootInstance({ header: 'x-first' })
+  const oneLayer = globalThis.fetch
+  const second = bootInstance({ header: 'x-second' })
+  try {
+    assert.notEqual(oneLayer, recorder.fn)
+    assert.equal(globalThis.fetch, oneLayer) // second apply adds a hook, never a wrapper
+
+    async function* firstCall() {
+      await fetch('https://llm.example.com/v1/chat')
+      yield 'chunk'
+    }
+    for await (const _ of first.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => firstCall())) { /* drain */ }
+    async function* secondCall() {
+      await fetch('https://llm.example.com/v1/chat')
+      yield 'chunk'
+    }
+    for await (const _ of second.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => secondCall())) { /* drain */ }
+
+    assert.equal(recorder.calls.length, 2)
+    assert.equal(recorder.calls[0].headers.get('x-first'), 'abc')
+    assert.equal(recorder.calls[1].headers.get('x-second'), 'abc')
+    assert.equal(recorder.calls[0].headers.has('x-second'), false)
+    assert.equal(recorder.calls[1].headers.has('x-first'), false)
+  } finally {
+    for (const dispose of first.disposers) dispose?.()
+    for (const dispose of second.disposers) dispose?.()
+    recorder.restore()
+  }
+})
+
+test('dispatcher: an external wrapper survives a reload and no layer is added', async () => {
+  const recorder = installFetchRecorder()
+  const first = bootInstance({ header: 'x-session-id' })
+  const dispatcher = globalThis.fetch
+  let wrapperCalls = 0
+  const wrapper = (input, init) => {
+    wrapperCalls += 1
+    return dispatcher(input, init)
+  }
+  globalThis.fetch = wrapper
+  let second
+  try {
+    for (const dispose of first.disposers) dispose?.()
+    // Our dispatcher is fronted by someone else: unload must not restore over it.
+    assert.equal(globalThis.fetch, wrapper)
+    assert.equal(first.warnings.filter((line) => /wrapped after this plugin loaded/.test(line)).length, 1)
+
+    // An HMR-style reload registers into the same registry: still one layer.
+    second = bootInstance({ header: 'x-session-id' })
+    assert.equal(globalThis.fetch, wrapper)
+    async function* inner() {
+      await fetch('https://llm.example.com/v1/chat')
+      yield 'chunk'
+    }
+    for await (const _ of second.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())) { /* drain */ }
+    assert.equal(wrapperCalls, 1)
+    assert.equal(recorder.calls.length, 1)
+    assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  } finally {
+    for (const dispose of second?.disposers ?? []) dispose?.()
+    // Drop the leftover registry/wrapper so later tests start from a clean fetch.
+    delete globalThis[Symbol.for('dsh-session-header#fetch-dispatcher@1')]
+    recorder.restore()
+  }
+})
+
+test('dispatcher: a throwing hook is isolated from the request and other hooks', async () => {
+  const recorder = installFetchRecorder()
+  const inst = bootInstance({ header: 'x-session-id' })
+  try {
+    register('test#boom', () => {
+      throw new Error('boom')
+    }, inst.ctx.logger)
+    async function* firstCall() {
+      await fetch('https://llm.example.com/v1/chat')
+      yield 'chunk'
+    }
+    for await (const _ of inst.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => firstCall())) { /* drain */ }
+    assert.equal(recorder.calls.length, 1) // the request still went out exactly once
+    assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc') // our hook still worked
+    const failures = () => inst.warnings.filter((line) => /skipped a failing fetch hook/.test(line)).length
+    assert.equal(failures(), 1)
+
+    async function* secondCall() {
+      await fetch('https://llm.example.com/v1/chat')
+      yield 'chunk'
+    }
+    for await (const _ of inst.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => secondCall())) { /* drain */ }
+    assert.equal(failures(), 1) // same signature stays quiet on later requests
+  } finally {
+    unregister('test#boom')
+    for (const dispose of inst.disposers) dispose?.()
+    recorder.restore()
+  }
+})
+
+test('dispatcher: a second dispose is silent and changes nothing', () => {
+  const recorder = installFetchRecorder()
+  const inst = bootInstance({ header: 'x-session-id' })
+  try {
+    for (const dispose of inst.disposers) dispose?.()
+    assert.equal(globalThis.fetch, recorder.fn)
+    const afterFirst = inst.warnings.length
+    for (const dispose of inst.disposers) dispose?.()
+    assert.equal(inst.warnings.length, afterFirst)
+    assert.equal(globalThis.fetch, recorder.fn)
+  } finally {
+    recorder.restore()
+  }
+})
+
+test('dispatcher: apply, dispose, apply installs one fresh layer and restores strictly', async () => {
+  const recorder = installFetchRecorder()
+  try {
+    const first = bootInstance({ header: 'x-session-id' })
+    const firstLayer = globalThis.fetch
+    assert.notEqual(firstLayer, recorder.fn)
+    for (const dispose of first.disposers) dispose?.()
+    assert.equal(globalThis.fetch, recorder.fn)
+
+    const second = bootInstance({ header: 'x-session-id' })
+    assert.notEqual(globalThis.fetch, recorder.fn)
+    assert.notEqual(globalThis.fetch, firstLayer) // a new single layer, not a stack
+    async function* inner() {
+      await fetch('https://llm.example.com/v1/chat')
+      yield 'chunk'
+    }
+    for await (const _ of second.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())) { /* drain */ }
+    assert.equal(recorder.calls.length, 1) // one dispatch, not one per historical layer
+    for (const dispose of second.disposers) dispose?.()
+    assert.equal(globalThis.fetch, recorder.fn)
+  } finally {
+    recorder.restore()
+  }
+})
+
+test('dispatcher: string, URL and Request inputs behave the same', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat')
+    await fetch(new URL('https://llm.example.com/v1/chat'))
+    await fetch(new Request('https://llm.example.com/v1/chat'))
+    yield 'chunk'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 3)
+  for (const call of recorder.calls) assert.equal(call.headers.get('x-session-id'), 'abc')
+})
+
+test('dispatcher: hook ids are unique across module copies and dispose stays scoped', async () => {
+  // Two module copies of this package would each own a fresh counter; the ids
+  // must not collide, or one copy's dispose deletes the other copy's hook.
+  const recorder = installFetchRecorder()
+  const first = bootInstance({ header: 'x-session-id' })
+  const second = bootInstance({ header: 'x-session-id' })
+  try {
+    const registry = globalThis[Symbol.for('dsh-session-header#fetch-dispatcher@1')]
+    assert.equal(registry.hooks.size, 2)
+    const ids = [...registry.hooks.keys()]
+    assert.notEqual(ids[0], ids[1])
+    for (const id of ids) {
+      assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+    }
+    // Disposing one copy removes exactly its own hook and keeps the layer.
+    for (const dispose of first.disposers) dispose?.()
+    assert.equal(registry.hooks.size, 1)
+    assert.equal(globalThis.fetch, registry.dispatcher)
+    // The survivor still injects through the shared registry.
+    async function* inner() {
+      await fetch('https://llm.example.com/v1/chat')
+      yield 'chunk'
+    }
+    for await (const _ of second.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())) { /* drain */ }
+    assert.equal(recorder.calls.length, 1)
+    assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+    for (const dispose of second.disposers) dispose?.()
+    assert.equal(globalThis.fetch, recorder.fn)
+  } finally {
+    for (const dispose of second.disposers) dispose?.()
+    recorder.restore()
+  }
+})

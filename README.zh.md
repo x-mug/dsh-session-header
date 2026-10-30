@@ -84,6 +84,8 @@ x-session-id: ba104306-a748-4052-a6e3-ab60be2e4c1f
 - `llm-deepseek` adapter 自身每次请求已带 `x-deepseek-harness-session-id`；本插件是 provider 中立的，默认绝不覆盖已有 header——仅当 `overwriteHeaders` 显式列入本插件的 header 名时才覆盖。
 - 绝不触碰 `attributionHeaders()`（harness 的 User-Agent 归因契约）。
 - 并发会话正确处理：header 值按调用经由 AsyncLocalStorage 解析，不经过共享可变状态。
+- `globalThis.fetch` 补丁是共享的单例分发器：每个实例（以及每次 HMR 重载）都只往版本化 `Symbol.for` 键下那一个包装层注册 hook，叠加不会增加层数。卸载只移除本实例的 hook；当最后一个 hook 移除且没人再包住我们的 dispatcher 时，还原原始 fetch。若已被别的补丁包住，则保留那层包装、我们的 dispatcher 变为纯透传，只告警一次。
+- hook 契约：hook 绝不读取或消费 `input.body`；返回 `{ input }` 或 `{ init }` 以替换分发器转发的内容，返回空表示原样透传。hook 按注册顺序执行；抛错的 hook 只对该请求被跳过（按签名限流告警），不影响其它 hook，也不影响请求本身。
 
 ## 许可
 

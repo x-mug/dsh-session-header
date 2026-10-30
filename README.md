@@ -84,6 +84,8 @@ Every request of the same conversation carries the same id; a spawned subagent's
 - The `llm-deepseek` adapter already sends its own `x-deepseek-harness-session-id` on every request; this plugin is provider-neutral and never overwrites an existing header by default — only when `overwriteHeaders` explicitly lists this plugin's own header is the existing value replaced.
 - `attributionHeaders()` (the harness User-Agent attribution contract) is never touched.
 - Concurrent sessions are handled correctly: the header value is resolved per call through AsyncLocalStorage, not through shared mutable state.
+- The `globalThis.fetch` patch is one shared dispatcher: every instance — and every HMR re-apply — registers a hook into a single wrapper installed under a versioned `Symbol.for` key, so stacking never adds another layer. Unloading removes only that instance's hook; the original fetch comes back when the last hook goes and nothing wrapped our dispatcher. If something did wrap it, that wrapper stays and our dispatcher becomes an inert passthrough, with one warning.
+- Hook contract: a hook never reads or consumes `input.body`; it returns `{ input }` or `{ init }` to replace what the dispatcher forwards, and nothing to pass the call through. Hooks run in registration order; a hook that throws is skipped for that request (rate-limited warning) without affecting the other hooks or the request itself.
 
 ## License
 
