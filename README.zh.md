@@ -2,6 +2,8 @@
 
 [English](README.md) | 中文
 
+> **维护中的 fork。** 本仓库是 [`x-mug/dsh-session-header`](https://github.com/x-mug/dsh-session-header)，从 [`homily707/dsh-session-header`](https://github.com/homily707/dsh-session-header) 的 `79a96e6` 分叉而来。相对上游的加固见 [CHANGELOG.md](CHANGELOG.md)；上游仍是原始项目。
+
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件：给 harness 发出的**每一个 LLM 请求**注入 `x-session-id` header，值为**发起该次调用的 harness session id**。
 
 ## 为什么需要它
@@ -28,10 +30,10 @@ harness 没有请求级 header 缝——`GenerateOptions` 没有 headers 字段�
 ### 作为 bundle 安装（推荐）
 
 ```sh
-dsh plugin --profile <name> add github:homily707/dsh-session-header
+dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.3.0
 ```
 
-本包是纯 JavaScript、无构建脚本，不需要 pnpm ≥ 10 的构建授权。要获得可复现的安装，请锁定 tag 或 commit（`github:homily707/dsh-session-header#<tag-or-sha>`）。验证层并启动：
+本包是纯 JavaScript、无构建脚本，不需要 pnpm ≥ 10 的构建授权。要获得可复现的安装，请锁定 tag 或 commit（`github:x-mug/dsh-session-header#<tag-or-sha>`）。验证层并启动：
 
 ```sh
 dsh --profile <name> --dump-config   # 应能看到 "# == dsh-session-header" 层

@@ -2,6 +2,8 @@
 
 English | [中文](README.zh.md)
 
+> **Maintained fork.** This is [`x-mug/dsh-session-header`](https://github.com/x-mug/dsh-session-header), forked from [`homily707/dsh-session-header`](https://github.com/homily707/dsh-session-header) at `79a96e6`. It carries the hardening listed in [CHANGELOG.md](CHANGELOG.md); the upstream project remains the original.
+
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that injects an `x-session-id` HTTP header onto **every LLM provider request** the harness sends, carrying the **harness session id of that exact call**.
 
 ## Why
@@ -28,10 +30,10 @@ Requires the `dsh` CLI and Node ≥ 22.
 ### As a bundle (recommended)
 
 ```sh
-dsh plugin --profile <name> add github:homily707/dsh-session-header
+dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.3.0
 ```
 
-This package is plain JavaScript with no build scripts, so the pnpm ≥ 10 build allowance is not needed. For a reproducible install, pin a tag or commit (`github:homily707/dsh-session-header#<tag-or-sha>`). Verify the layer and boot:
+This package is plain JavaScript with no build scripts, so the pnpm ≥ 10 build allowance is not needed. For a reproducible install, pin a tag or commit (`github:x-mug/dsh-session-header#<tag-or-sha>`). Verify the layer and boot:
 
 ```sh
 dsh --profile <name> --dump-config   # look for the "# == dsh-session-header" layer
