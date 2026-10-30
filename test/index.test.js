@@ -37,8 +37,13 @@ function installFetchRecorder() {
 function makeContext() {
   const handlers = new Map()
   const disposers = []
+  const errors = []
+  const warnings = []
   const ctx = {
-    logger: { warn() {} },
+    logger: {
+      warn(line) { warnings.push(String(line)) },
+      error(line) { errors.push(String(line)) },
+    },
     on(event, handler) {
       handlers.set(event, handler)
     },
@@ -46,13 +51,13 @@ function makeContext() {
       disposers.push(fn())
     },
   }
-  return { ctx, handlers, disposers }
+  return { ctx, handlers, disposers, errors, warnings }
 }
 
 /** Install recorder, apply plugin, and wire automatic cleanup. */
 function boot(t, config = {}) {
   const recorder = installFetchRecorder()
-  const { ctx, handlers, disposers } = makeContext()
+  const { ctx, handlers, disposers, errors, warnings } = makeContext()
   // Go through the Schema, the way the harness loads the plugin: defaults for
   // toolEndpoints/overwriteHeaders/header come from Config, not from apply().
   apply(ctx, Config(config))
@@ -60,7 +65,7 @@ function boot(t, config = {}) {
     for (const dispose of disposers) dispose?.()
     recorder.restore()
   })
-  return { ctx, handlers, recorder }
+  return { ctx, handlers, recorder, errors, warnings }
 }
 
 test('tools/execute: injects header when URL matches a configured endpoint prefix', async (t) => {
@@ -446,4 +451,188 @@ test('tools/execute: non-UUID agent id with a -session- tail is not truncated', 
   await handlers.get('tools/execute')(exec, next)
   assert.equal(recorder.calls.length, 1)
   assert.equal(recorder.calls[0].headers.get('x-opencode-session'), 'agent-session-not-a-uuid')
+})
+
+// --- config validation: a rejected config fails loudly and touches nothing ---
+
+/** Apply a config that must be rejected; the recorder stands in for the real fetch. */
+function bootRejected(config) {
+  const recorder = installFetchRecorder()
+  const { ctx, handlers, disposers, errors, warnings } = makeContext()
+  let thrown
+  try {
+    apply(ctx, Config(config))
+  } catch (error) {
+    thrown = error
+  }
+  return {
+    recorder,
+    handlers,
+    disposers,
+    errors,
+    warnings,
+    thrown,
+    restore() {
+      for (const dispose of disposers) dispose?.()
+      recorder.restore()
+    },
+  }
+}
+
+test('apply: an invalid header name is logged, thrown, and leaves fetch untouched', () => {
+  const { recorder, handlers, errors, thrown, restore } = bootRejected({ header: 'x session id' })
+  try {
+    assert.ok(thrown instanceof Error)
+    assert.match(thrown.message, /not a valid HTTP field name/)
+    assert.equal(errors.length, 1)
+    assert.match(errors[0], /not a valid HTTP field name/)
+    assert.equal(globalThis.fetch, recorder.fn)
+    assert.equal(handlers.size, 0)
+  } finally {
+    restore()
+  }
+})
+
+test('apply: a rejected config still lets ordinary fetches through exactly once', async () => {
+  const { recorder, handlers, errors, restore } = bootRejected({ header: 'cookie' })
+  try {
+    assert.equal(errors.length, 1)
+    assert.equal(handlers.has('llm/stream'), false)
+    assert.equal(handlers.has('tools/execute'), false)
+    await fetch('https://llm.example.com/v1/chat', { headers: { accept: 'text/event-stream' } })
+    assert.equal(recorder.calls.length, 1)
+    assert.equal(recorder.calls[0].headers.has('cookie'), false)
+  } finally {
+    restore()
+  }
+})
+
+test('apply: every forbidden header name is rejected', () => {
+  for (const header of ['authorization', 'cookie', 'content-type', 'user-agent', 'x-forwarded-for', 'host']) {
+    const { errors, thrown, restore } = bootRejected({ header })
+    try {
+      assert.ok(thrown instanceof Error, `${header} must be rejected`)
+      assert.equal(errors.length, 1)
+      assert.match(errors[0], /is forbidden/)
+    } finally {
+      restore()
+    }
+  }
+})
+
+test('apply: the forbidden list matches case-insensitively', () => {
+  const { errors, thrown, restore } = bootRejected({ header: 'Authorization' })
+  try {
+    assert.ok(thrown instanceof Error)
+    assert.equal(errors.length, 1)
+    assert.match(errors[0], /is forbidden/)
+  } finally {
+    restore()
+  }
+})
+
+test('apply: an empty header name is rejected', () => {
+  const { errors, thrown, restore } = bootRejected({ header: '' })
+  try {
+    assert.ok(thrown instanceof Error)
+    assert.match(errors[0], /non-empty string/)
+  } finally {
+    restore()
+  }
+})
+
+test('apply: a value with CR/LF is rejected', () => {
+  const { recorder, errors, thrown, restore } = bootRejected({ header: 'x-session-id', value: 'a\r\nInjected: yes' })
+  try {
+    assert.ok(thrown instanceof Error)
+    assert.match(errors[0], /not a valid HTTP header value/)
+    assert.equal(globalThis.fetch, recorder.fn)
+  } finally {
+    restore()
+  }
+})
+
+test('apply: an empty value is rejected and sends no header', async () => {
+  const { recorder, errors, thrown, restore } = bootRejected({ header: 'x-session-id', value: '' })
+  try {
+    assert.ok(thrown instanceof Error)
+    assert.match(errors[0], /must not be empty/)
+    await fetch('https://llm.example.com/v1/chat')
+    assert.equal(recorder.calls.length, 1)
+    assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+  } finally {
+    restore()
+  }
+})
+
+test('apply: a valid custom header still injects', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'X-Request-Id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-request-id'), 'abc')
+})
+
+test('llm/stream: an empty session id gets no header', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: '' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+})
+
+test('patchedFetch: an internal error falls back to the untouched request once', async (t) => {
+  const { handlers, recorder, warnings } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    const RealHeaders = globalThis.Headers
+    class ExplodingHeaders extends RealHeaders {
+      set() {
+        throw new Error('boom')
+      }
+    }
+    globalThis.Headers = ExplodingHeaders
+    try {
+      await fetch('https://llm.example.com/v1/chat/completions')
+    } finally {
+      globalThis.Headers = RealHeaders
+    }
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+  assert.equal(warnings.filter((line) => /after an internal error/.test(line)).length, 1)
+})
+
+test('patchedFetch: repeated internal errors warn once per signature', async (t) => {
+  const { handlers, recorder, warnings } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    const RealHeaders = globalThis.Headers
+    class ExplodingHeaders extends RealHeaders {
+      set() {
+        throw new Error('boom')
+      }
+    }
+    globalThis.Headers = ExplodingHeaders
+    try {
+      await fetch('https://llm.example.com/v1/a')
+      await fetch('https://llm.example.com/v1/b')
+    } finally {
+      globalThis.Headers = RealHeaders
+    }
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 2)
+  assert.equal(warnings.filter((line) => /after an internal error/.test(line)).length, 1)
 })

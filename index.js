@@ -40,11 +40,17 @@ export const name = 'dsh-session-header'
 export const inject = ['llm']
 
 export const Config = Schema.object({
-  /** Header name to inject; HTTP field names are case-insensitive on the wire. */
+  /**
+   * Header name to inject; HTTP field names are case-insensitive on the wire.
+   * An invalid field name, or a credential/routing/framing header, rejects the
+   * configuration at apply time — logged, then thrown, so the plugin shows up
+   * as failed instead of loading healthy and never injecting.
+   */
   header: Schema.string().default('x-session-id'),
   /**
    * Fixed header value. Unset means "use the harness session id of the call
    * in flight" (`GenerateOptions.sessionId`); calls with neither get no header.
+   * When set it must be non-empty and a valid HTTP header value (no CR/LF/NUL).
    */
   value: Schema.string(),
   /**
@@ -104,19 +110,104 @@ export function normalizeSessionId(id) {
 }
 
 /**
+ * Headers this plugin never writes.
+ *
+ * - credentials: `authorization`, `proxy-authorization`, cookies, API keys —
+ *   the session id must never be handed to a gateway as proof of identity;
+ * - routing: `host`, `origin`, `referer`, `forwarded`, `x-forwarded-for`,
+ *   `x-real-ip` — these describe where a request came from, which the plugin
+ *   cannot know;
+ * - framing/meta: `content-length`, `content-type`, `content-encoding`,
+ *   `transfer-encoding`, `connection`, `upgrade`, `te`, `trailer`,
+ *   `keep-alive`, `expect`, `accept`, `user-agent` — writing any of these
+ *   corrupts the request or overrides what the caller negotiated.
+ */
+const FORBIDDEN_HEADERS = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'set-cookie',
+  'host',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'upgrade',
+  'x-api-key',
+  'api-key',
+  'te',
+  'trailer',
+  'keep-alive',
+  'proxy-authenticate',
+  'forwarded',
+  'x-forwarded-for',
+  'x-real-ip',
+  'origin',
+  'referer',
+  'content-type',
+  'content-encoding',
+  'expect',
+  'accept',
+  'user-agent',
+])
+
+/**
+ * Validate a configured header name and fixed value against the runtime
+ * `Headers` implementation — the same oracle the hot path uses, so no
+ * hand-written field-name grammar can drift from what actually gets written.
+ * @param {string} header - the configured header name.
+ * @param {string | undefined} value - the configured fixed value, if any.
+ * @returns {string | undefined} a diagnostic, or undefined when both are usable.
+ */
+function configDiagnostic(header, value) {
+  if (typeof header !== 'string' || header.length === 0) {
+    return `config.header must be a non-empty string (got ${JSON.stringify(header)})`
+  }
+  try {
+    new Headers().set(header, 'x')
+  } catch (error) {
+    return `config.header ${JSON.stringify(header)} is not a valid HTTP field name: ${error instanceof Error ? error.message : String(error)}`
+  }
+  if (FORBIDDEN_HEADERS.has(header.toLowerCase())) {
+    return `config.header ${JSON.stringify(header)} is forbidden: this plugin never writes credential, routing, or framing headers`
+  }
+  if (value !== undefined) {
+    if (value.length === 0) {
+      return 'config.value must not be empty; unset it to use the live session id'
+    }
+    try {
+      new Headers().set(header, value)
+    } catch (error) {
+      return `config.value is not a valid HTTP header value: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+  return undefined
+}
+
+/**
  * Plugin entry. `config.header` names the header, `config.value` optionally
  * fixes its value; per call, the AsyncLocalStorage store carries the resolved
  * value (plus the tool-phase gate), and a present store marks "this is an LLM
  * fetch".
  */
 export function apply(ctx, config) {
-  const als = new AsyncLocalStorage()
-  const originalFetch = globalThis.fetch
-
   // The Schema above already filled the defaults (the harness validates plugin
   // config through it), so these are read once here rather than re-defaulted on
   // every injection.
   const { header, value: fixedValue, toolEndpoints, overwriteHeaders } = config
+
+  // Fail closed BEFORE any global side effect: nothing is patched and no
+  // listener is registered, so a rejected config cannot degrade requests. Log
+  // first, then throw: Cordis catches an apply() rejection and marks the fiber
+  // failed, which is exactly the state an operator needs to see — a silent
+  // return would leave the plugin looking healthy while doing nothing.
+  const problem = configDiagnostic(header, fixedValue)
+  if (problem !== undefined) {
+    ctx.logger.error(`dsh-session-header: not installing — ${problem}`)
+    throw new Error(`dsh-session-header: ${problem}`)
+  }
+
+  const als = new AsyncLocalStorage()
+  const originalFetch = globalThis.fetch
   // Only one question is ever asked of `overwriteHeaders`: may we replace OUR
   // header? Case-insensitive match, the same rule the wire uses.
   const mayOverwrite = overwriteHeaders.some((name) => name.toLowerCase() === header.toLowerCase())
@@ -169,39 +260,68 @@ export function apply(ctx, config) {
 
   // Shared by both scopes: a configured value is sent verbatim, a live id is
   // normalized to one stable wire shape, and no id at all means "no header".
-  const resolveValue = (id) =>
-    fixedValue ?? (id === undefined ? undefined : normalizeSessionId(id))
+  // An empty live id counts as no id — the same rule the tool phase applies to
+  // `exec.agent.id` — so a blank session id never becomes an empty header.
+  const resolveValue = (id) => {
+    if (fixedValue !== undefined) return fixedValue
+    if (id === undefined || id === '') return undefined
+    return normalizeSessionId(id)
+  }
+
+  // One warning per distinct internal failure. A failure mode repeats on every
+  // request, so logging per request would bury everything else; the cap keeps
+  // an adversarial stream of novel messages from growing the set forever.
+  const reportedFallbacks = new Set()
+  const reportFallback = (error) => {
+    const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+    const signature = detail.slice(0, 200)
+    if (reportedFallbacks.size >= 32 || reportedFallbacks.has(signature)) return
+    reportedFallbacks.add(signature)
+    ctx.logger.warn(`dsh-session-header: not injecting this request after an internal error (${signature})`)
+  }
 
   const patchedFetch = (input, init) => {
-    const injection = als.getStore()
-    if (injection === undefined || injection.value === undefined) {
+    // Only the plugin's own work runs inside this try: the upstream call is
+    // made after it succeeds, so a plugin bug falls back to the untouched
+    // request instead of retrying — or swallowing — someone else's fetch.
+    let target = input
+    let overrides = init
+    try {
+      const injection = als.getStore()
+      // No store, no value, or a tool-phase fetch outside the whitelist: pass
+      // the caller's own arguments through untouched.
+      if (
+        injection !== undefined &&
+        injection.value !== undefined &&
+        !(injection.toolPhase === true && !urlMatchesEndpoint(input))
+      ) {
+        // Collect headers from both fetch() spellings: a Request object carries
+        // its own, and init.headers overrides them per the fetch standard.
+        const headers = new Headers(input instanceof Request ? input.headers : undefined)
+        if (init?.headers !== undefined) {
+          for (const [key, value] of new Headers(init.headers)) headers.set(key, value)
+        }
+        // Inject only when absent — unless `overwriteHeaders` lists our header,
+        // in which case the live session id replaces whatever placeholder value
+        // another layer (an official provider) hard-coded.
+        if (!headers.has(header) || mayOverwrite) {
+          headers.set(header, injection.value)
+          if (input instanceof Request && init === undefined) {
+            // A bare Request input owns its headers; rebuild it so the original
+            // — which may be reused by the caller — keeps arriving providers
+            // without us.
+            target = new Request(input, { headers })
+            overrides = undefined
+          } else {
+            overrides = { ...init, headers }
+          }
+        }
+      }
+    } catch (error) {
+      reportFallback(error)
       return originalFetch(input, init)
     }
-    // Tool-phase scopes carry the whitelist gate; skip fetches that do not
-    // target one of the configured endpoints so the session id never leaks to
-    // third-party hosts the tools talk to.
-    if (injection.toolPhase === true && !urlMatchesEndpoint(input)) {
-      return originalFetch(input, init)
-    }
-    // Collect headers from both fetch() spellings: a Request object carries
-    // its own, and init.headers overrides them per the fetch standard.
-    const headers = new Headers(input instanceof Request ? input.headers : undefined)
-    if (init?.headers !== undefined) {
-      for (const [key, value] of new Headers(init.headers)) headers.set(key, value)
-    }
-    // Inject only when absent — unless `overwriteHeaders` lists our header, in
-    // which case the live session id replaces whatever placeholder value
-    // another layer (an official provider) hard-coded.
-    if (headers.has(header) && !mayOverwrite) {
-      return originalFetch(input, init)
-    }
-    headers.set(header, injection.value)
-    // A bare Request input owns its headers; rebuild it so the original —
-    // which may be reused by the caller — keeps arriving providers without us.
-    if (input instanceof Request && init === undefined) {
-      return originalFetch(new Request(input, { headers }))
-    }
-    return originalFetch(input, { ...init, headers })
+    return originalFetch(target, overrides)
   }
 
   globalThis.fetch = patchedFetch

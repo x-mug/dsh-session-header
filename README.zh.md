@@ -63,6 +63,8 @@ dsh --patch ./my-overlay.yml
 | `toolEndpoints` | string[] | `[]` | 工具执行期匹配的 URL 前缀。非空时，`tools/execute` 瀑布内的 fetch（例如工具里调用的网关 web-search Messages API）仅当 URL 以某前缀开头才注入 header——第三方工具目标（web_fetch 抓任意网页、GitHub、MCP 服务器等）不受影响。前缀解析出的路径为 `/` 时等于放行整个 origin，该 origin 下所有路径都会带上 session id。默认空 = 保持原有仅 LLM 注入行为 |
 | `overwriteHeaders` | string[] | `[]` | 必须包含本插件自己的 `header` 名（大小写不敏感）才允许替换该头已存在的值；列其它名字没有任何效果。未列出的头仍遵守"不覆盖"规则。某些官方 provider 会硬编码占位值（如 `dsh-web-search-deepseek` 发送 `x-opencode-session: dsh-web-search`），网关会当作缺失拒绝；要替换该占位值，需同时把该头设为本插件的 header，例如 `header: x-opencode-session` 配 `overwriteHeaders: [x-opencode-session]`，这样真实的会话 id 才会替换它。 |
 
+配置在插件加载时校验一次。`header` 必须是运行时 `Headers` 接受的字段名，且不能是凭据、路由或分帧类 header（完整名单见 `index.js`）；`value` 一旦设置必须非空且是合法 header 值。校验不通过会先记日志再抛错，插件在插件列表里显示为失败，而不是加载成功却从不注入。唯一的软失败是 `toolEndpoints`：无法解析或非 http(s) 的前缀会被丢弃并告警。
+
 ## 验证
 
 把某个 provider 的 `baseURL` 指向会记录请求 header 的网关（或任何回显请求头的端点），开一个会话：
