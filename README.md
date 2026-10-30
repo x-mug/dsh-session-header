@@ -17,7 +17,7 @@ Context propagation uses `AsyncLocalStorage`. With the default empty `toolEndpoi
 
 Semantics of the value:
 
-- default: `GenerateOptions.sessionId` of the call in flight, with the harness's `session-` branding prefix stripped (a plain UUID is sent) — main-session turns, compaction/title helper calls, and in-process subagent children each report **their own** session id (subagents get their own child session ids); inside a `tools/execute` call the id comes from `exec.agent.id` (the agent running the tool) and loses the same prefix;
+- default: `GenerateOptions.sessionId` of the call in flight, normalized before it goes on the wire: an `<agentId>-session-<uuid>` id yields that UUID, and any other id only loses a leading `session-` prefix — so a persistent `session-<uuid>` sends a bare UUID, and a configurable agent reports that same UUID instead of its `<agentId>-session-<uuid>` spelling; main-session turns, compaction/title helper calls, and in-process subagent children each report **their own** session id (subagents get their own child session ids); inside a `tools/execute` call the id comes from `exec.agent.id` (the agent running the tool) and is normalized the same way;
 - `value` config: a fixed value for every call instead (sent verbatim, no prefix stripping);
 - calls with neither get no header.
 

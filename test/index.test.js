@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apply, Config } from '../index.js'
+import { apply, Config, normalizeSessionId } from '../index.js'
 
 /** Record every fetch the plugin (and the code under test) performs. */
 function installFetchRecorder() {
@@ -337,4 +337,113 @@ test('tools/execute: case-insensitive overwrite of a placeholder header', async 
   await handlers.get('tools/execute')(exec, next)
   assert.equal(recorder.calls.length, 1)
   assert.equal(recorder.calls[0].headers.get('x-opencode-session'), 'uuid-123')
+})
+
+// --- session id normalization: one stable wire value per conversation ---
+
+const UUID = '7f3e9a52-1b6c-4d8e-9f01-23456789abcd'
+const UPPER_UUID = '7F3E9A52-1B6C-4D8E-9F01-23456789ABCD'
+
+test('normalizeSessionId: every harness id shape maps onto one wire value', () => {
+  // Persistent sessions report `session-<uuid>`.
+  assert.equal(normalizeSessionId(`session-${UUID}`), UUID)
+  // An id minted without an explicit name is `session-<n>`: only the prefix goes.
+  assert.equal(normalizeSessionId('session-42'), '42')
+  // Configurable agents report `<agentId>-session-<uuid>`: the UUID is the identity.
+  assert.equal(normalizeSessionId(`agent-alpha-session-${UUID}`), UUID)
+  assert.equal(normalizeSessionId(`sub-agent-2-session-${UUID}`), UUID)
+  // A UUID is case-insensitive, so every spelling normalizes to lower case.
+  assert.equal(normalizeSessionId(`agent-alpha-session-${UPPER_UUID}`), UUID)
+  assert.equal(normalizeSessionId(`session-${UPPER_UUID}`), UUID)
+  // The tail match is case-insensitive end to end, separator included.
+  assert.equal(normalizeSessionId(`agent-alpha-SESSION-${UUID}`), UUID)
+  // A bare UUID passes through.
+  assert.equal(normalizeSessionId(UUID), UUID)
+  // Conservative: only a trailing `-session-<uuid>` is unwrapped.
+  assert.equal(normalizeSessionId('agent-session-not-a-uuid'), 'agent-session-not-a-uuid')
+  assert.equal(normalizeSessionId('prefix-session-abc'), 'prefix-session-abc')
+  assert.equal(normalizeSessionId('agent-session-'), 'agent-session-')
+  // Ordinary strings and the empty id are returned unchanged.
+  assert.equal(normalizeSessionId('custom-session-thing'), 'custom-session-thing')
+  assert.equal(normalizeSessionId(''), '')
+  // An absent id is not a value: it stays undefined, never the string "undefined".
+  assert.equal(normalizeSessionId(undefined), undefined)
+})
+
+test('llm/stream: agent-form id is normalized to the bare UUID', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: `agent-alpha-session-${UUID}` }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), UUID)
+})
+
+test('llm/stream: a call without a session id gets no header', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({}, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+})
+
+test('llm/stream: fixed config.value wins over an agent-form session id', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id', value: 'fixed-value' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: `agent-alpha-session-${UUID}` }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'fixed-value')
+})
+
+test('tools/execute: agent-form id is normalized the same way', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-opencode-session',
+    toolEndpoints: ['https://gateway.example.com/'],
+  })
+  const exec = { agent: { id: `agent-alpha-session-${UUID}` } }
+  const next = async () => {
+    await fetch('https://gateway.example.com/messages')
+  }
+  await handlers.get('tools/execute')(exec, next)
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-opencode-session'), UUID)
+})
+
+test('tools/execute: uppercase UUID tail is lowercased', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-opencode-session',
+    toolEndpoints: ['https://gateway.example.com/'],
+  })
+  const exec = { agent: { id: `agent-alpha-session-${UPPER_UUID}` } }
+  const next = async () => {
+    await fetch('https://gateway.example.com/messages')
+  }
+  await handlers.get('tools/execute')(exec, next)
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-opencode-session'), UUID)
+})
+
+test('tools/execute: non-UUID agent id with a -session- tail is not truncated', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-opencode-session',
+    toolEndpoints: ['https://gateway.example.com/'],
+  })
+  const exec = { agent: { id: 'agent-session-not-a-uuid' } }
+  const next = async () => {
+    await fetch('https://gateway.example.com/messages')
+  }
+  await handlers.get('tools/execute')(exec, next)
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-opencode-session'), 'agent-session-not-a-uuid')
 })

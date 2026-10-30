@@ -20,9 +20,11 @@
  * see no store and pass through untouched.
  *
  * A fixed value can be configured instead of the live session id (sent
- * verbatim); the live id's `session-` branding prefix is stripped so a plain
- * UUID goes on the wire. Calls with neither a configured value nor a session
- * id get no header. A header anyone else already set is never overwritten
+ * verbatim). The live id is normalized to one stable wire shape — an
+ * `<agentId>-session-<uuid>` id yields that UUID, any other id only loses a
+ * leading `session-` — so the same conversation reports the same id whichever
+ * harness path produced it. Calls with neither a configured value nor a
+ * session id get no header. A header anyone else already set is never overwritten
  * (`Headers` matching is case-insensitive, the same rule the wire uses).
  * Unloading the plugin restores the original fetch.
  *
@@ -65,6 +67,41 @@ export const Config = Schema.object({
    */
   overwriteHeaders: Schema.array(Schema.string()).default([]),
 })
+
+/**
+ * The trailing `-session-<uuid>` shape of the ids the harness's configurable
+ * agents report (`<agentId>-session-<uuid>`, built by dsh-agent-loop). Only a
+ * canonical 36-character UUID tail is accepted, and the whole tail match is
+ * case-insensitive, so an upper-case UUID still normalizes.
+ */
+const AGENT_SESSION_ID = /-session-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
+
+/** A value that is already one canonical UUID, in any casing. */
+const UUID_ONLY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * Normalize one harness session id into the value sent on the wire.
+ *
+ * - `<prefix>-session-<uuid>` (a configurable agent's id, ending in a
+ *   canonical UUID) becomes that UUID;
+ * - any other id starting with `session-` becomes the id without that prefix;
+ * - everything else is returned unchanged;
+ * - `undefined` stays `undefined`, which means "no session to report".
+ *
+ * A bare UUID is lowercased: UUIDs compare case-insensitively, so the same
+ * session must not reach the wire in two spellings. Any other value keeps its
+ * own casing. Only the trailing `-session-<uuid>` shape is unwrapped, so an id
+ * that merely contains "session" (or `session-` mid-string) is never truncated.
+ * @param {unknown} id - the raw id the harness reported.
+ * @returns {string | undefined} the value to send for this id.
+ */
+export function normalizeSessionId(id) {
+  if (id === undefined) return undefined
+  const text = String(id)
+  const agentForm = AGENT_SESSION_ID.exec(text)
+  const bare = agentForm !== null ? agentForm[1] : text.replace(/^session-/, '')
+  return UUID_ONLY.test(bare) ? bare.toLowerCase() : bare
+}
 
 /**
  * Plugin entry. `config.header` names the header, `config.value` optionally
@@ -130,10 +167,10 @@ export function apply(ctx, config) {
     })
   }
 
-  // Shared by both scopes: a configured value is sent verbatim, a live id
-  // loses the `session-` branding prefix, and no id at all means "no header".
+  // Shared by both scopes: a configured value is sent verbatim, a live id is
+  // normalized to one stable wire shape, and no id at all means "no header".
   const resolveValue = (id) =>
-    fixedValue ?? (id === undefined ? undefined : String(id).replace(/^session-/, ''))
+    fixedValue ?? (id === undefined ? undefined : normalizeSessionId(id))
 
   const patchedFetch = (input, init) => {
     const injection = als.getStore()

@@ -17,7 +17,7 @@ harness 没有请求级 header 缝——`GenerateOptions` 没有 headers 字段�
 
 取值语义：
 
-- 默认：取当前调用 `GenerateOptions.sessionId`，并剥掉 harness 的 `session-` 品牌前缀（发送纯 UUID）——主会话各轮次、压缩/起标题辅助调用、in-process 子 agent 各自上报**自己的** session id（子 agent 拥有独立的 child session id）；工具执行期（`tools/execute`）改取 `exec.agent.id`（正在运行该工具的 agent），同样剥掉 `session-` 前缀；
+- 默认：取当前调用 `GenerateOptions.sessionId`，发送前先归一：形如 `<agentId>-session-<uuid>` 的取其中的 UUID，其余只剥掉开头的 `session-` 前缀——因此持久化 `session-<uuid>` 发出纯 UUID，配置型 agent 也发出同一个 UUID，而不是它的 `<agentId>-session-<uuid>` 形态；主会话各轮次、压缩/起标题辅助调用、in-process 子 agent 各自上报**自己的** session id（子 agent 拥有独立的 child session id）；工具执行期（`tools/execute`）改取 `exec.agent.id`（正在运行该工具的 agent），同样做归一；
 - 配置 `value`：所有调用使用固定值（按配置原样发送，不剥前缀）；
 - 两者皆无的调用不发这个 header。
 
