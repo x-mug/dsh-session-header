@@ -19,7 +19,7 @@ function installFetchRecorder() {
     }
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url
-    calls.push({ url, headers })
+    calls.push({ url, headers, redirect: init?.redirect, request: input instanceof Request ? input : undefined })
     return new Response('ok', { status: 200 })
   }
   globalThis.fetch = fn
@@ -636,3 +636,185 @@ test('patchedFetch: repeated internal errors warn once per signature', async (t)
   assert.equal(recorder.calls.length, 2)
   assert.equal(warnings.filter((line) => /after an internal error/.test(line)).length, 1)
 })
+
+// --- phase allowlists + optional redirect guard ---
+
+test('llmEndpointAllowlist: only matching URLs are injected', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-session-id',
+    llmEndpointAllowlist: ['https://llm.example.com/v1'],
+  })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat')
+    await fetch('https://other.example.org/v1/chat')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 2)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+})
+
+test('llmEndpointAllowlist: a sibling domain never matches', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-session-id',
+    llmEndpointAllowlist: ['https://llm.example.com'],
+  })
+  async function* inner() {
+    await fetch('https://llm.example.com.evil.io/v1/chat')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+})
+
+test('llmEndpointAllowlist: path prefixes respect boundaries', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-session-id',
+    llmEndpointAllowlist: ['https://llm.example.com/zen/go/v1'],
+  })
+  async function* inner() {
+    await fetch('https://llm.example.com/zen/go/v10/messages')
+    await fetch('https://llm.example.com/zen/go/v1/messages')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 2)
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+  assert.equal(recorder.calls[1].headers.get('x-session-id'), 'abc')
+})
+
+test('llmEndpointAllowlist: an empty list leaves the LLM phase unrestricted', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://anything.example.org/v1/chat')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+})
+
+test('tool phase: llmEndpointAllowlist does not gate tool fetches', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-opencode-session',
+    toolEndpoints: ['https://gateway.example.com/'],
+    llmEndpointAllowlist: ['https://llm.example.com/v1'],
+  })
+  const exec = { agent: { id: 'session-uuid-123' } }
+  const next = async () => {
+    await fetch('https://gateway.example.com/messages')
+  }
+  await handlers.get('tools/execute')(exec, next)
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-opencode-session'), 'uuid-123')
+})
+
+test('redirectGuard: a stamped init-form request gets redirect "error"', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id', redirectGuard: true })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat', { method: 'POST' })
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  assert.equal(recorder.calls[0].redirect, 'error')
+})
+
+test('redirectGuard: an explicit init.redirect is preserved', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id', redirectGuard: true })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat', { redirect: 'manual' })
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].redirect, 'manual')
+})
+
+test('redirectGuard: a Request input is rebuilt with redirect "error"', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id', redirectGuard: true })
+  async function* inner() {
+    await fetch(new Request('https://llm.example.com/v1/chat'))
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  assert.equal(recorder.calls[0].request.redirect, 'error')
+})
+
+test('redirectGuard: a Request pinned to manual keeps its redirect', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id', redirectGuard: true })
+  async function* inner() {
+    await fetch(new Request('https://llm.example.com/v1/chat', { redirect: 'manual' }))
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].request.redirect, 'manual')
+})
+
+test('redirectGuard: off by default leaves the caller\'s redirect alone', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  assert.equal(recorder.calls[0].redirect, undefined)
+})
+
+test('redirectGuard: a Request whose body was consumed warns and passes the call through', async (t) => {
+  const { handlers, recorder, warnings } = boot(t, { header: 'x-session-id', redirectGuard: true })
+  async function* inner() {
+    const request = new Request('https://llm.example.com/v1/chat', { method: 'POST', body: 'payload' })
+    await request.text() // consume the body: rebuilding this Request must fail
+    await fetch(request)
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+  assert.equal(warnings.filter((line) => /after an internal error/.test(line)).length, 1)
+})
+
+// --- fail-closed vs fail-soft: the two URL lists differ on purpose ---
+
+test('apply: an invalid llmEndpointAllowlist entry is rejected at load', () => {
+  for (const bad of ['not-a-url', 'ftp://llm.example.com/v1']) {
+    const { errors, thrown, restore } = bootRejected({ llmEndpointAllowlist: [bad] })
+    try {
+      assert.ok(thrown instanceof Error, `${bad} must be rejected`)
+      assert.equal(errors.length, 1)
+      assert.match(errors[0], /llmEndpointAllowlist/)
+    } finally {
+      restore()
+    }
+  }
+})
+
+test('apply: invalid toolEndpoints entries only warn (soft failure)', async (t) => {
+  const { handlers, warnings } = boot(t, {
+    header: 'x-session-id',
+    toolEndpoints: ['not-a-url'],
+  })
+  assert.equal(warnings.filter((line) => /unparseable toolEndpoint/.test(line)).length, 1)
+  assert.equal(handlers.has('llm/stream'), true)
+  assert.equal(handlers.has('tools/execute'), true)
+})
+

@@ -64,6 +64,20 @@ export const Config = Schema.object({
    */
   toolEndpoints: Schema.array(Schema.string()).default([]),
   /**
+   * Allowlist of URL prefixes for the LLM phase. Empty (the default) means NO
+   * restriction: every fetch inside an `llm/stream` scope is a candidate, which
+   * is what a provider adapter's own internal fetches need — the opposite of
+   * `toolEndpoints`, where empty disables the tool phase. When non-empty, only
+   * fetches whose URL starts with one of these prefixes get the header (same
+   * origin-equal + path-boundary rule as `toolEndpoints`). Setting it is the
+   * recommended posture. A prefix whose path is `/` covers the whole origin,
+   * including same-origin OAuth token endpoints; write a specific path prefix
+   * to keep those out. Every entry must parse as an http(s) URL: a bad entry
+   * rejects the configuration at load, so a typo cannot silently turn the
+   * allowlist into "no restriction" (unlike `toolEndpoints`, which only warns).
+   */
+  llmEndpointAllowlist: Schema.array(Schema.string()).default([]),
+  /**
    * Header names this plugin is allowed to OVERWRITE when they already carry a
    * value. Everything else keeps the "never overwrite" rule. Some official
    * providers hard-code placeholder values (e.g. dsh-web-search-deepseek sends
@@ -72,6 +86,17 @@ export const Config = Schema.object({
    * Case-insensitive match, default empty = never overwrite.
    */
   overwriteHeaders: Schema.array(Schema.string()).default([]),
+  /**
+   * Redirection guard, off by default so an existing deployment keeps its
+   * current behavior. When on, a request this plugin actually stamps gets
+   * `redirect: 'error'` unless the caller pinned `init.redirect`: fetch strips
+   * credentials on a cross-origin redirect but would carry this header to the
+   * new origin, so following one can leak the session id. Only an explicit
+   * `init.redirect` is preserved verbatim: a `Request` input keeps a
+   * non-default `redirect` (e.g. `manual`) but its default `follow` becomes
+   * `error`.
+   */
+  redirectGuard: Schema.boolean().default(false),
 })
 
 /**
@@ -156,9 +181,10 @@ const FORBIDDEN_HEADERS = new Set([
  * hand-written field-name grammar can drift from what actually gets written.
  * @param {string} header - the configured header name.
  * @param {string | undefined} value - the configured fixed value, if any.
- * @returns {string | undefined} a diagnostic, or undefined when both are usable.
+ * @param {string[]} llmEndpointAllowlist - LLM-phase URL prefixes.
+ * @returns {string | undefined} a diagnostic, or undefined when all are usable.
  */
-function configDiagnostic(header, value) {
+function configDiagnostic(header, value, llmEndpointAllowlist) {
   if (typeof header !== 'string' || header.length === 0) {
     return `config.header must be a non-empty string (got ${JSON.stringify(header)})`
   }
@@ -169,6 +195,23 @@ function configDiagnostic(header, value) {
   }
   if (FORBIDDEN_HEADERS.has(header.toLowerCase())) {
     return `config.header ${JSON.stringify(header)} is forbidden: this plugin never writes credential, routing, or framing headers`
+  }
+  // The LLM allowlist is a restriction, so a bad entry must not be dropped: an
+  // empty result would read as "no restriction" and silently widen the
+  // injection surface. toolEndpoints keeps its soft failure (it only widens
+  // when valid, and empty already means "tool phase off").
+  if (Array.isArray(llmEndpointAllowlist)) {
+    for (const prefix of llmEndpointAllowlist) {
+      let parsed
+      try {
+        parsed = new URL(prefix)
+      } catch {
+        return `config.llmEndpointAllowlist entry ${JSON.stringify(prefix)} is not a valid URL`
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return `config.llmEndpointAllowlist entry ${JSON.stringify(prefix)} is not an http(s) URL`
+      }
+    }
   }
   if (value !== undefined) {
     if (value.length === 0) {
@@ -193,14 +236,14 @@ export function apply(ctx, config) {
   // The Schema above already filled the defaults (the harness validates plugin
   // config through it), so these are read once here rather than re-defaulted on
   // every injection.
-  const { header, value: fixedValue, toolEndpoints, overwriteHeaders } = config
+  const { header, value: fixedValue, llmEndpointAllowlist, toolEndpoints, overwriteHeaders, redirectGuard } = config
 
   // Fail closed BEFORE any global side effect: nothing is patched and no
   // listener is registered, so a rejected config cannot degrade requests. Log
   // first, then throw: Cordis catches an apply() rejection and marks the fiber
   // failed, which is exactly the state an operator needs to see — a silent
   // return would leave the plugin looking healthy while doing nothing.
-  const problem = configDiagnostic(header, fixedValue)
+  const problem = configDiagnostic(header, fixedValue, llmEndpointAllowlist)
   if (problem !== undefined) {
     ctx.logger.error(`dsh-session-header: not installing — ${problem}`)
     throw new Error(`dsh-session-header: ${problem}`)
@@ -212,31 +255,36 @@ export function apply(ctx, config) {
   // header? Case-insensitive match, the same rule the wire uses.
   const mayOverwrite = overwriteHeaders.some((name) => name.toLowerCase() === header.toLowerCase())
 
-  // Pre-compile toolEndpoints into origin-anchored matchers so the whitelist
-  // can never match a sibling domain: `https://gateway.example.com` must not
-  // match `https://gateway.example.com.evil.io/x`. The URL parser normalizes
-  // host casing and default ports; the path comparison then enforces a
-  // boundary character so `/zen/go/v1` matches `/zen/go/v1/messages` but not
+  // Compile configured URL prefixes into origin-anchored matchers so a
+  // whitelist can never match a sibling domain: `https://gateway.example.com`
+  // must not match `https://gateway.example.com.evil.io/x`. The URL parser
+  // normalizes host casing and default ports; the path comparison then enforces
+  // a boundary character so `/zen/go/v1` matches `/zen/go/v1/messages` but not
   // `/zen/go/v10`. Unparseable or non-http(s) prefixes are dropped (fail
   // closed: a broken prefix simply never matches, so no header is sent).
-  const endpointMatchers = toolEndpoints
-    .map((prefix) => {
-      let parsed
-      try {
-        parsed = new URL(prefix)
-      } catch {
-        ctx.logger.warn(`dsh-session-header: ignoring unparseable toolEndpoint ${JSON.stringify(prefix)}`)
-        return undefined
-      }
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        ctx.logger.warn(`dsh-session-header: ignoring non-http(s) toolEndpoint ${JSON.stringify(prefix)}`)
-        return undefined
-      }
-      return { origin: parsed.origin, path: parsed.pathname }
-    })
-    .filter((entry) => entry !== undefined)
+  const compileEndpoints = (phase, prefixes) =>
+    prefixes
+      .map((prefix) => {
+        let parsed
+        try {
+          parsed = new URL(prefix)
+        } catch {
+          ctx.logger.warn(`dsh-session-header: ignoring unparseable ${phase} ${JSON.stringify(prefix)}`)
+          return undefined
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          ctx.logger.warn(`dsh-session-header: ignoring non-http(s) ${phase} ${JSON.stringify(prefix)}`)
+          return undefined
+        }
+        return { origin: parsed.origin, path: parsed.pathname }
+      })
+      .filter((entry) => entry !== undefined)
 
-  const urlMatchesEndpoint = (input) => {
+  const toolMatchers = compileEndpoints('toolEndpoint', toolEndpoints)
+  const llmMatchers = compileEndpoints('llmEndpointAllowlist', llmEndpointAllowlist)
+
+  /** Whether one fetch target matches any compiled prefix of a phase. */
+  const matchesEndpoint = (matchers, input) => {
     let target
     try {
       const raw =
@@ -246,7 +294,7 @@ export function apply(ctx, config) {
     } catch {
       return false
     }
-    return endpointMatchers.some(({ origin, path }) => {
+    return matchers.some(({ origin, path }) => {
       if (target.origin !== origin) return false
       if (path === '/') return true
       const pathname = target.pathname
@@ -280,6 +328,14 @@ export function apply(ctx, config) {
     ctx.logger.warn(`dsh-session-header: not injecting this request after an internal error (${signature})`)
   }
 
+  // Redirection policy: only rewrite a request the operator opted into
+  // guarding, and never override a redirect the caller chose itself.
+  const guardedRedirect = (input, init) => {
+    if (init?.redirect !== undefined) return init.redirect
+    if (input instanceof Request && input.redirect !== 'follow') return input.redirect
+    return 'error'
+  }
+
   const patchedFetch = (input, init) => {
     // Only the plugin's own work runs inside this try: the upstream call is
     // made after it succeeds, so a plugin bug falls back to the untouched
@@ -288,12 +344,12 @@ export function apply(ctx, config) {
     let overrides = init
     try {
       const injection = als.getStore()
-      // No store, no value, or a tool-phase fetch outside the whitelist: pass
-      // the caller's own arguments through untouched.
+      // No store, no value, or a fetch outside this phase's whitelist: pass the
+      // caller's own arguments through untouched.
       if (
         injection !== undefined &&
         injection.value !== undefined &&
-        !(injection.toolPhase === true && !urlMatchesEndpoint(input))
+        (injection.matchers === null || matchesEndpoint(injection.matchers, input))
       ) {
         // Collect headers from both fetch() spellings: a Request object carries
         // its own, and init.headers overrides them per the fetch standard.
@@ -306,14 +362,26 @@ export function apply(ctx, config) {
         // another layer (an official provider) hard-coded.
         if (!headers.has(header) || mayOverwrite) {
           headers.set(header, injection.value)
+          // Optional guard: fetch strips credentials on a cross-origin redirect
+          // but would carry this header to the new origin, so a guarded request
+          // refuses to follow one. Applied in BOTH call shapes and only when
+          // `redirectGuard` is on and the caller pinned no redirect of its own.
+          const extra = redirectGuard ? { redirect: guardedRedirect(input, init) } : {}
           if (input instanceof Request && init === undefined) {
             // A bare Request input owns its headers; rebuild it so the original
             // — which may be reused by the caller — keeps arriving providers
-            // without us.
-            target = new Request(input, { headers })
-            overrides = undefined
+            // without us. The rebuild fails when the body was already consumed:
+            // say so (rate-limited) and hand the caller's own call through
+            // rather than injecting a header nobody can send.
+            try {
+              target = new Request(input, { headers, ...extra })
+              overrides = undefined
+            } catch (error) {
+              reportFallback(error)
+              return originalFetch(input, init)
+            }
           } else {
-            overrides = { ...init, headers }
+            overrides = { ...init, headers, ...extra }
           }
         }
       }
@@ -342,7 +410,12 @@ export function apply(ctx, config) {
   ctx.on('llm/stream', async function* (options, next) {
     const inner = next()
     const iterator = inner[Symbol.asyncIterator]()
-    const scope = { value: resolveValue(options.sessionId) }
+    // Ungated by default (a provider adapter's own fetches must keep working);
+    // a non-empty `llmEndpointAllowlist` opts this scope into the URL whitelist.
+    const scope = {
+      value: resolveValue(options.sessionId),
+      matchers: llmMatchers.length > 0 ? llmMatchers : null,
+    }
     let exhausted = false
     try {
       while (true) {
@@ -380,7 +453,8 @@ export function apply(ctx, config) {
     ) {
       return next()
     }
-    // `toolPhase` turns on the whitelist gate for every fetch in this chain.
-    return als.run({ value: resolveValue(agentId), toolPhase: true }, () => next())
+    // `matchers` turns on the whitelist gate for every fetch in this chain; an
+    // empty result (every prefix was rejected) fails closed: nothing matches.
+    return als.run({ value: resolveValue(agentId), matchers: toolMatchers }, () => next())
   })
 }
