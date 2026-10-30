@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session header",
+    "description": "Inject a stable session-id header into every LLM request; stands down once the harness sends its own."
+  }
+}

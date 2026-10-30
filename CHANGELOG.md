@@ -5,6 +5,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 Forked from [`homily707/dsh-session-header`](https://github.com/homily707/dsh-session-header) at `79a96e6` (0.2.1).
 
+## [0.4.1] - 2026-10-30
+
+### Added
+
+- Locale metadata (`locale/zh.json`, `locale/en.json`) and a custom `icon.svg`
+  so the plugin list shows a localized title, description and icon instead of the
+  bare package name.
+
 ## [0.4.0] - 2026-10-30
 
 ### Added
