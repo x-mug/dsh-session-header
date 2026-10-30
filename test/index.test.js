@@ -33,17 +33,21 @@ function installFetchRecorder() {
   }
 }
 
-/** Cordis-like context stub: captures on() handlers, runs effect() setup. */
-function makeContext() {
+/** Cordis-like context stub: captures logger output, handlers, effects and services. */
+function makeContext(services = {}) {
   const handlers = new Map()
   const disposers = []
   const errors = []
   const warnings = []
+  const infos = []
   const ctx = {
     logger: {
       warn(line) { warnings.push(String(line)) },
       error(line) { errors.push(String(line)) },
+      info(line) { infos.push(String(line)) },
     },
+    fiber: { entry: { options: { id: 'session-header' } } },
+    get(name) { return services[name] },
     on(event, handler) {
       handlers.set(event, handler)
     },
@@ -51,20 +55,20 @@ function makeContext() {
       disposers.push(fn())
     },
   }
-  return { ctx, handlers, disposers, errors, warnings }
+  return { ctx, handlers, disposers, errors, warnings, infos }
 }
 
 /** Apply one plugin instance against the fetch already installed (no recorder). */
-function bootInstance(config = {}) {
-  const { ctx, handlers, disposers, errors, warnings } = makeContext()
+function bootInstance(config = {}, services = {}) {
+  const { ctx, handlers, disposers, errors, warnings, infos } = makeContext(services)
   apply(ctx, Config(config))
-  return { ctx, handlers, disposers, errors, warnings }
+  return { ctx, handlers, disposers, errors, warnings, infos }
 }
 
 /** Install recorder, apply plugin, and wire automatic cleanup. */
-function boot(t, config = {}) {
+function boot(t, config = {}, services = {}) {
   const recorder = installFetchRecorder()
-  const { ctx, handlers, disposers, errors, warnings } = makeContext()
+  const { ctx, handlers, disposers, errors, warnings, infos } = makeContext(services)
   // Go through the Schema, the way the harness loads the plugin: defaults for
   // toolEndpoints/overwriteHeaders/header come from Config, not from apply().
   apply(ctx, Config(config))
@@ -72,7 +76,7 @@ function boot(t, config = {}) {
     for (const dispose of disposers) dispose?.()
     recorder.restore()
   })
-  return { ctx, handlers, recorder, errors, warnings }
+  return { ctx, handlers, recorder, errors, warnings, infos }
 }
 
 test('tools/execute: injects header when URL matches a configured endpoint prefix', async (t) => {
@@ -1011,4 +1015,162 @@ test('dispatcher: hook ids are unique across module copies and dispose stays sco
     for (const dispose of second.disposers) dispose?.()
     recorder.restore()
   }
+})
+
+// --- host-side guards: kill switch, native-header detection, settings channel ---
+
+/** Flush the fire-and-forget settings promise chain. */
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+test('guards: enabled=false installs nothing but keeps the schema loaded', () => {
+  const recorder = installFetchRecorder()
+  try {
+    const inst = bootInstance({ enabled: false })
+    assert.equal(inst.handlers.size, 0)
+    assert.equal(inst.disposers.length, 0)
+    assert.equal(globalThis.fetch, recorder.fn)
+    assert.deepEqual(inst.errors, [])
+    assert.equal(inst.infos.filter((line) => /disabled by configuration/.test(line)).length, 1)
+    const defaults = Config({})
+    assert.equal(defaults.enabled, true)
+    // Volatile fields parse into live references, read through .get().
+    assert.equal(defaults.nativeHeaderSeen.get(), false)
+    assert.equal(defaults.nativeSessionHeaders.length, 8)
+  } finally {
+    recorder.restore()
+  }
+})
+
+test('guards: an existing native session header stops injection and logs once', async (t) => {
+  const { handlers, recorder, infos } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat', { headers: { 'X-DeepSeek-Harness-Session-Id': 'native' } })
+    await fetch('https://llm.example.com/v1/chat', { headers: { 'x-deepseek-harness-session-id': 'native' } })
+    yield 'chunk'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 2)
+  for (const call of recorder.calls) {
+    assert.equal(call.headers.has('x-session-id'), false)
+    assert.equal(call.headers.get('x-deepseek-harness-session-id'), 'native')
+  }
+  // Case-insensitive detection, and the message is emitted exactly once.
+  assert.equal(infos.filter((line) => /native session header/.test(line)).length, 1)
+})
+
+test('guards: an existing own header keeps the never-overwrite rule', async (t) => {
+  const { handlers, recorder, infos } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat', { headers: { 'x-session-id': 'someone-else' } })
+    yield 'chunk'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'someone-else')
+  // Our own header is never "native": that value could be a sibling instance's
+  // injection, so it must not stand this one down.
+  assert.equal(infos.filter((line) => /native session header/.test(line)).length, 0)
+})
+
+test('guards: a sibling instance header is never mistaken for a native one', async () => {
+  const recorder = installFetchRecorder()
+  const updates = []
+  const settings = {
+    update(...args) {
+      updates.push(args)
+      return Promise.resolve()
+    },
+  }
+  // Two rows of the same plugin (HMR, a duplicate entry): both inject the same
+  // header name, and the second hook sees the first hook's value on the call.
+  const first = bootInstance({ header: 'x-session-id' }, { settings })
+  const second = bootInstance({ header: 'x-session-id' }, { settings })
+  try {
+    async function* inner() {
+      await fetch('https://llm.example.com/v1/chat')
+      yield 'chunk'
+    }
+    // Compose both llm/stream handlers the way the waterfall does, so both
+    // AsyncLocalStorage scopes are live for the one adapter fetch.
+    const piped = first.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () =>
+      second.handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner()),
+    )
+    for await (const _ of piped) { /* drain */ }
+    await flush()
+    assert.equal(recorder.calls.length, 1)
+    assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+    assert.equal(second.infos.filter((line) => /native session header/.test(line)).length, 0)
+    assert.equal(updates.length, 0) // no nativeHeaderSeen write, no "uninstall me" prompt
+  } finally {
+    for (const dispose of first.disposers) dispose?.()
+    for (const dispose of second.disposers) dispose?.()
+    recorder.restore()
+  }
+})
+
+test('guards: counters summarize on the first event and every 100 requests', async (t) => {
+  const { handlers, recorder, infos } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    for (let index = 0; index < 100; index += 1) {
+      await fetch('https://llm.example.com/v1/chat', { headers: { session_id: `native-${index}` } })
+    }
+    yield 'chunk'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 100)
+  const summaries = infos.filter((line) => /nativeSkipped=/.test(line))
+  assert.equal(summaries.length, 2)
+  assert.match(summaries[0], /nativeSkipped=1/)
+  assert.match(summaries[1], /nativeSkipped=100/)
+})
+
+test('guards: a native sighting writes nativeHeaderSeen to settings exactly once', async (t) => {
+  const updates = []
+  const settings = {
+    update(...args) {
+      updates.push(args)
+      return Promise.resolve()
+    },
+  }
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' }, { settings })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat', { headers: { 'x-deepseek-harness-session-id': 'native' } })
+    await fetch('https://llm.example.com/v1/chat', { headers: { 'x-deepseek-harness-session-id': 'native' } })
+    yield 'chunk'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  await flush()
+  assert.equal(recorder.calls.length, 2)
+  for (const call of recorder.calls) assert.equal(call.headers.has('x-session-id'), false)
+  assert.equal(updates.length, 1)
+  assert.equal(updates[0][0], 'session-header') // the plugin's own entry id
+  assert.deepEqual(updates[0][1], { nativeHeaderSeen: true })
+  assert.equal(updates[0][2], undefined) // no expectedRevision = no CAS
+})
+
+test('guards: a settings failure never affects the request and warns once', async (t) => {
+  const settings = {
+    update() {
+      return Promise.reject(new Error('settings down'))
+    },
+  }
+  const { handlers, recorder, warnings } = boot(t, { header: 'x-session-id' }, { settings })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat', { headers: { 'x-deepseek-harness-session-id': 'native' } })
+    await fetch('https://llm.example.com/v1/chat', { headers: { 'x-deepseek-harness-session-id': 'native' } })
+    yield 'chunk'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  await flush()
+  assert.equal(recorder.calls.length, 2)
+  for (const call of recorder.calls) {
+    assert.equal(call.headers.has('x-session-id'), false)
+    assert.equal(call.headers.get('x-deepseek-harness-session-id'), 'native')
+  }
+  assert.equal(warnings.filter((line) => /nativeHeaderSeen/.test(line)).length, 1)
 })
