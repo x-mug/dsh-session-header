@@ -423,6 +423,71 @@ test('llm/stream: fixed config.value wins over an agent-form session id', async 
   assert.equal(recorder.calls[0].headers.get('x-session-id'), 'fixed-value')
 })
 
+
+test('llm/stream: an Auto review id names the session it works for', async (t) => {
+  const agents = { currentInitiator: () => ({ session: { id: `session-${UUID}` } }) }
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' }, { agents })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'auto-review:abc123' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), `auto-review:${WIRE}`)
+})
+
+test('llm/stream: without an initiator the review id is sent unchanged', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'auto-review:abc123' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'auto-review:abc123')
+})
+
+test('llm/stream: an empty reviewSessionPrefix disables the rewrite', async (t) => {
+  const agents = { currentInitiator: () => ({ session: { id: `session-${UUID}` } }) }
+  const { handlers, recorder } = boot(t, { header: 'x-session-id', reviewSessionPrefix: '' }, { agents })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'auto-review:abc123' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'auto-review:abc123')
+})
+
+test('llm/stream: a throwing initiator service never breaks the request', async (t) => {
+  const agents = {
+    currentInitiator() {
+      throw new Error('service unavailable')
+    },
+  }
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' }, { agents })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: 'auto-review:abc123' }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'auto-review:abc123')
+})
+
+test('llm/stream: a review id already naming its session stays stable', async (t) => {
+  const agents = { currentInitiator: () => ({ session: { id: `session-${UUID}` } }) }
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' }, { agents })
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  const gen = handlers.get('llm/stream')({ sessionId: `auto-review:${WIRE}` }, () => inner())
+  for await (const _ of gen) { /* drain */ }
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), `auto-review:${WIRE}`)
+})
+
 test('tools/execute: agent-form id is normalized the same way', async (t) => {
   const { handlers, recorder } = boot(t, {
     header: 'x-opencode-session',

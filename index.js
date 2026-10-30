@@ -89,6 +89,16 @@ export const Config = Schema.object({
    */
   value: Schema.string(),
   /**
+   * Prefix of a helper call's synthetic session id. The built-in Auto review
+   * runs under `auto-review:<hash>`, an id that names the work rather than the
+   * conversation, so a gateway can never tie that traffic to the session it
+   * belongs to. When a call's session id starts with this prefix, the header
+   * carries `<prefix>session-<initiating uuid>` instead — still its own
+   * identity and its own accounting, but traceable to the session. Empty
+   * disables the rewrite.
+   */
+  reviewSessionPrefix: Schema.string().default('auto-review:'),
+  /**
    * URL prefixes matched during tool execution. When non-empty, fetches that
    * happen inside a `tools/execute` waterfall (tool calls such as a web-search
    * Messages API against your model gateway) get the header ONLY when their
@@ -406,7 +416,7 @@ export function apply(ctx, config) {
   // The Schema above already filled the defaults (the harness validates plugin
   // config through it), so these are read once here rather than re-defaulted on
   // every injection.
-  const { enabled, nativeSessionHeaders, header, value: fixedValue, llmEndpointAllowlist, toolEndpoints, overwriteHeaders, redirectGuard } = config
+  const { enabled, nativeSessionHeaders, header, value: fixedValue, reviewSessionPrefix, llmEndpointAllowlist, toolEndpoints, overwriteHeaders, redirectGuard } = config
 
   // Fail closed BEFORE any global side effect: nothing is patched and no
   // listener is registered, so a rejected config cannot degrade requests. Log
@@ -486,10 +496,33 @@ export function apply(ctx, config) {
   // normalized to one stable wire shape, and no id at all means "no header".
   // An empty live id counts as no id — the same rule the tool phase applies to
   // `exec.agent.id` — so a blank session id never becomes an empty header.
-  const resolveValue = (id) => {
+  // Session id of the agent that initiated the call in flight. A helper call
+  // (Auto review) runs inside that agent's initiator scope, so this is the
+  // conversation the helper is working for.
+  const initiatorSessionId = () => {
+    try {
+      const id = ctx.get('agents')?.currentInitiator()?.session?.id
+      return typeof id === 'string' && id.length > 0 ? id : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** True when a live id is a helper's synthetic id that should name its session. */
+  const isReviewId = (id) =>
+    reviewSessionPrefix !== '' && typeof id === 'string' && id.startsWith(reviewSessionPrefix)
+
+  const resolveValue = (id, initiator) => {
     if (fixedValue !== undefined) return fixedValue
     if (id === undefined || id === '') return undefined
-    return normalizeSessionId(id)
+    const text = String(id)
+    if (isReviewId(text)) {
+      // Keep the helper's own identity, but name the session it works for:
+      // auto-review:<hash> becomes auto-review:session-<uuid>.
+      const real = initiator === undefined ? undefined : normalizeSessionId(initiator)
+      return real === undefined ? normalizeSessionId(text) : `${reviewSessionPrefix}${real}`
+    }
+    return normalizeSessionId(text)
   }
 
   // Detection counters, logged rather than exposed (the host has no status
@@ -660,7 +693,7 @@ export function apply(ctx, config) {
     // Ungated by default (a provider adapter's own fetches must keep working);
     // a non-empty `llmEndpointAllowlist` opts this scope into the URL whitelist.
     const scope = {
-      value: resolveValue(options.sessionId),
+      value: resolveValue(options.sessionId, isReviewId(options.sessionId) ? initiatorSessionId() : undefined),
       matchers: llmMatchers.length > 0 ? llmMatchers : null,
     }
     let exhausted = false

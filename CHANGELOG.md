@@ -5,6 +5,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 Forked from [`homily707/dsh-session-header`](https://github.com/homily707/dsh-session-header) at `79a96e6` (0.2.1).
 
+## [0.4.3] - 2026-10-30
+
+### Added
+
+- `reviewSessionPrefix` (default `auto-review:`): a helper call running under a
+  synthetic session id keeps that identity but names the session it works for.
+  An Auto review call whose session id is `auto-review:<hash>` now sends
+  `auto-review:session-<initiating uuid>` on the wire, so the gateway can tie
+  that traffic back to its conversation while still accounting for it separately.
+  An empty prefix disables the rewrite; a missing or failing initiator service
+  leaves the id unchanged.
+
 ## [0.4.2] - 2026-10-30
 
 ### Changed

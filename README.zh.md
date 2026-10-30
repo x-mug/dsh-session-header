@@ -30,7 +30,7 @@ harness 没有请求级 header 缝——`GenerateOptions` 没有 headers 字段�
 ### 作为 bundle 安装（推荐）
 
 ```sh
-dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.2
+dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.3
 ```
 
 本包是纯 JavaScript、无构建脚本，不需要 pnpm ≥ 10 的构建授权。要获得可复现的安装，请锁定 tag 或 commit（`github:x-mug/dsh-session-header#<tag-or-sha>`）。验证层并启动：
@@ -63,6 +63,7 @@ dsh --patch ./my-overlay.yml
 | `enabled` | boolean | `true` | 总开关。`false` 时不安装任何东西——无 fetch hook、无监听器——但 schema 仍加载，便于设置界面关掉或重开。 |
 | `header` | string | `x-session-id` | 注入的 header 名；线上大小写不敏感 |
 | `value` | string | — | 固定值；不设 = 取当前调用的 harness session id |
+| `reviewSessionPrefix` | string | `auto-review:` | 辅助调用合成 id 的前缀。以此开头的调用改为发送 `<前缀>session-<发起会话 uuid>`——仍是自己的身份与账目，但能追溯到所属会话。空字符串关闭该改写。 |
 | `toolEndpoints` | string[] | `[]` | 工具执行期匹配的 URL 前缀。非空时，`tools/execute` 瀑布内的 fetch（例如工具里调用的网关 web-search Messages API）仅当 URL 以某前缀开头才注入 header——第三方工具目标（web_fetch 抓任意网页、GitHub、MCP 服务器等）不受影响。前缀解析出的路径为 `/` 时等于放行整个 origin，该 origin 下所有路径都会带上 session id。默认空 = 保持原有仅 LLM 注入行为 |
 | `llmEndpointAllowlist` | string[] | `[]` | LLM 阶段允许注入的 URL 前缀。**空数组表示不限制**——与 `toolEndpoints` 相反（它为空等于关掉工具阶段）：空时 `llm/stream` 作用域内任何 fetch 都是候选，adapter 自身的内部请求因此能正常工作。非空时只有 URL 命中前缀才注入（与 `toolEndpoints` 相同的 origin 全等 + 路径边界规则）。建议开启限制。前缀路径写成 `/` 等于覆盖整个 origin（同域 OAuth token 端点也会命中），要排除就必须写具体路径前缀。每一项都必须是 http(s) URL：非法项会让配置在加载时被拒绝（不同于 `toolEndpoints`，那里非法项只会被丢弃、不影响加载）。 |
 | `overwriteHeaders` | string[] | `[]` | 必须包含本插件自己的 `header` 名（大小写不敏感）才允许替换该头已存在的值；列其它名字没有任何效果。未列出的头仍遵守"不覆盖"规则。某些官方 provider 会硬编码占位值（如 `dsh-web-search-deepseek` 发送 `x-opencode-session: dsh-web-search`），网关会当作缺失拒绝；要替换该占位值，需同时把该头设为本插件的 header，例如 `header: x-opencode-session` 配 `overwriteHeaders: [x-opencode-session]`，这样真实的会话 id 才会替换它。 |

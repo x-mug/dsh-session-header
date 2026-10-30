@@ -30,7 +30,7 @@ Requires the `dsh` CLI and Node ≥ 22.
 ### As a bundle (recommended)
 
 ```sh
-dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.2
+dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.3
 ```
 
 This package is plain JavaScript with no build scripts, so the pnpm ≥ 10 build allowance is not needed. For a reproducible install, pin a tag or commit (`github:x-mug/dsh-session-header#<tag-or-sha>`). Verify the layer and boot:
@@ -63,6 +63,7 @@ dsh --patch ./my-overlay.yml
 | `enabled` | boolean | `true` | Master switch. `false` installs nothing — no fetch hook, no listeners — while the schema still loads, so a settings surface can turn it back on. |
 | `header` | string | `x-session-id` | header name to inject; case-insensitive on the wire |
 | `value` | string | — | fixed value; unset = the harness session id of the call in flight |
+| `reviewSessionPrefix` | string | `auto-review:` | Prefix of a helper call's synthetic id. A call whose session id starts with it sends `<prefix>session-<initiating uuid>` instead — its own identity and accounting, but traceable to the session it works for. Empty disables the rewrite. |
 | `toolEndpoints` | string[] | `[]` | URL prefixes matched during tool execution. When non-empty, fetches inside a `tools/execute` waterfall — e.g. a gateway web-search Messages API called from a tool — get the header only when their URL starts with one of these prefixes; third-party tool targets (web_fetch of arbitrary pages, GitHub, MCP servers) stay untouched. A prefix whose parsed path is `/` matches the whole origin, so every path under that origin receives the session id. Empty (default) keeps the upstream LLM-only injection. |
 | `llmEndpointAllowlist` | string[] | `[]` | URL prefixes for the LLM phase. **Empty means no restriction** — the opposite of `toolEndpoints`, whose empty value disables the tool phase: every fetch inside an `llm/stream` scope is a candidate, which is what adapter-internal fetches need. Non-empty restricts injection to URLs starting with one of these prefixes (same origin-equal + path-boundary rule as `toolEndpoints`). Turning it on is the recommended posture. A prefix whose path is `/` covers the whole origin — including same-origin OAuth token endpoints — so write a specific path prefix to keep those out. Every entry must be an http(s) URL: a bad entry rejects the configuration at load (unlike `toolEndpoints`, where a bad entry is merely dropped from the tool phase). |
 | `overwriteHeaders` | string[] | `[]` | Must contain this plugin's own `header` name (case-insensitive) to allow replacing that header's existing value; any other name has no effect. Everything else keeps the "never overwrite" rule. Some official providers hard-code placeholder values (e.g. `dsh-web-search-deepseek` sends `x-opencode-session: dsh-web-search`), which gateways reject as missing; to replace that placeholder, set that header's name as this plugin's header too — e.g. `header: x-opencode-session` with `overwriteHeaders: [x-opencode-session]` — so the live session id replaces it. |
