@@ -30,7 +30,7 @@ Requires the `dsh` CLI and Node ≥ 22.
 ### As a bundle (recommended)
 
 ```sh
-dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.3.0
+dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.0
 ```
 
 This package is plain JavaScript with no build scripts, so the pnpm ≥ 10 build allowance is not needed. For a reproducible install, pin a tag or commit (`github:x-mug/dsh-session-header#<tag-or-sha>`). Verify the layer and boot:

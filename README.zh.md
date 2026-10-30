@@ -30,7 +30,7 @@ harness 没有请求级 header 缝——`GenerateOptions` 没有 headers 字段�
 ### 作为 bundle 安装（推荐）
 
 ```sh
-dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.3.0
+dsh plugin --profile <name> add github:x-mug/dsh-session-header#v0.4.0
 ```
 
 本包是纯 JavaScript、无构建脚本，不需要 pnpm ≥ 10 的构建授权。要获得可复现的安装，请锁定 tag 或 commit（`github:x-mug/dsh-session-header#<tag-or-sha>`）。验证层并启动：

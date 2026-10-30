@@ -5,6 +5,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 Forked from [`homily707/dsh-session-header`](https://github.com/homily707/dsh-session-header) at `79a96e6` (0.2.1).
 
+## [0.4.0] - 2026-10-30
+
+### Added
+
+- **Native-header stand-down.** When a request already carries one of the
+  configured `nativeSessionHeaders` (the session headers the harness and its
+  gateways use), the plugin stops injecting and records the sighting, so it makes
+  itself redundant the moment the harness starts sending a session header on its
+  own. The plugin's own `header` name is excluded from this check so two instances
+  cannot mistake each other for a native sender.
+- `enabled` kill switch (default `true`).
+- `nativeSessionHeaders` configuration (defaults to the eight session header names
+  used across the harness, Pi, OpenCode and Claude Code).
+- Client half: a one-time banner in `shell.overlay`, shown when a native header has
+  been detected, telling the user the plugin is no longer needed and can be
+  uninstalled; plus a settings section showing the detected state, the inject header
+  name, and a button that brings the notice back. Dismissal is remembered in
+  `localStorage`.
+- Injection counters (`injected`, `nativeSkipped`) logged on the first event of each
+  kind and every 100 requests; `fallback` failures use their own rate-limited
+  warning instead.
+
+### Changed
+
+- The host writes `nativeHeaderSeen` into its own volatile config exactly once per
+  sighting so the client half can react without polling; a failing write never
+  affects request handling.
+
+### Fixed
+
+- `exports` now exposes `./package.json` as well, so hosts reading the package
+  manifest through the package name keep working.
+- The client half parsed `settings.describe()` payloads with an inverted type check,
+  which turned a successful response into an error state.
+
 ## [0.3.0] - 2026-10-30
 
 ### Added
