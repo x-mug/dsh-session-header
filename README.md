@@ -13,11 +13,11 @@ This plugin closes that gap with the two official interception points composed t
 - the **`llm/stream` waterfall** names the calls that are LLM calls and carries `options.sessionId`;
 - a **`globalThis.fetch` patch** adds the header, so every fetch-based adapter (`llm-deepseek`, `llm-pi-ai`, and any SDK whose transport bottoms out in global fetch) is covered without touching adapter code.
 
-Context propagation uses `AsyncLocalStorage`: only fetches that happen inside an LLM call's stream are touched; unrelated fetches (web RPC, telemetry, tool traffic) pass through untouched. A header anyone else already set is never overwritten (case-insensitive, per HTTP semantics). Unloading the plugin restores the original `fetch`.
+Context propagation uses `AsyncLocalStorage`. With the default empty `toolEndpoints` no `tools/execute` scope is established, so only fetches that happen inside an LLM call's stream are touched; web RPC, telemetry, and tool traffic pass through untouched. With a non-empty `toolEndpoints` every `tools/execute` call that carries an agent id also runs inside a scope, and only fetches whose URL starts with a configured prefix get the header; everything else — web RPC, telemetry, and third-party tool targets — stays untouched. The `llm/stream` scope itself has no URL whitelist — that gate applies only in the tool phase — so any fetch inside an LLM call's stream is a candidate for injection — the only remaining limits are a resolved value and the overwrite rule below. A header anyone else already set keeps its value unless `overwriteHeaders` opts this plugin's header in (case-insensitive, per HTTP semantics). Unloading the plugin restores the original `fetch`, but only while `globalThis.fetch` still points at this plugin's patch: if another patch wrapped it afterwards, the unload logs a warning and leaves that patch in place.
 
 Semantics of the value:
 
-- default: `GenerateOptions.sessionId` of the call in flight, with the harness's `session-` branding prefix stripped (a plain UUID is sent) — main-session turns, compaction/title helper calls, and in-process subagent children each report **their own** session id (subagents get their own child session ids);
+- default: `GenerateOptions.sessionId` of the call in flight, with the harness's `session-` branding prefix stripped (a plain UUID is sent) — main-session turns, compaction/title helper calls, and in-process subagent children each report **their own** session id (subagents get their own child session ids); inside a `tools/execute` call the id comes from `exec.agent.id` (the agent running the tool) and loses the same prefix;
 - `value` config: a fixed value for every call instead (sent verbatim, no prefix stripping);
 - calls with neither get no header.
 
@@ -31,7 +31,7 @@ Requires the `dsh` CLI and Node ≥ 22.
 dsh plugin --profile <name> add github:homily707/dsh-session-header
 ```
 
-This package is plain JavaScript with no build scripts, so the pnpm ≥ 10 build allowance is not needed. Verify the layer and boot:
+This package is plain JavaScript with no build scripts, so the pnpm ≥ 10 build allowance is not needed. For a reproducible install, pin a tag or commit (`github:homily707/dsh-session-header#<tag-or-sha>`). Verify the layer and boot:
 
 ```sh
 dsh --profile <name> --dump-config   # look for the "# == dsh-session-header" layer
@@ -60,8 +60,8 @@ dsh --patch ./my-overlay.yml
 | --- | --- | --- | --- |
 | `header` | string | `x-session-id` | header name to inject; case-insensitive on the wire |
 | `value` | string | — | fixed value; unset = the harness session id of the call in flight |
-| `toolEndpoints` | string[] | `[]` | URL prefixes matched during tool execution. When non-empty, fetches inside a `tools/execute` waterfall — e.g. a gateway web-search Messages API called from a tool — get the header only when their URL starts with one of these prefixes; third-party tool targets (web_fetch of arbitrary pages, GitHub, MCP servers) stay untouched. Empty (default) keeps the upstream LLM-only injection. |
-| `overwriteHeaders` | string[] | `[]` | Header names this plugin may overwrite when they already carry a value. Everything else keeps the "never overwrite" rule. Some official providers hard-code placeholder values (e.g. `dsh-web-search-deepseek` sends `x-opencode-session: dsh-web-search`), which gateways reject as missing; list the header here (`overwriteHeaders: [x-opencode-session]`) so the live session id replaces that placeholder. Case-insensitive. |
+| `toolEndpoints` | string[] | `[]` | URL prefixes matched during tool execution. When non-empty, fetches inside a `tools/execute` waterfall — e.g. a gateway web-search Messages API called from a tool — get the header only when their URL starts with one of these prefixes; third-party tool targets (web_fetch of arbitrary pages, GitHub, MCP servers) stay untouched. A prefix whose parsed path is `/` matches the whole origin, so every path under that origin receives the session id. Empty (default) keeps the upstream LLM-only injection. |
+| `overwriteHeaders` | string[] | `[]` | Must contain this plugin's own `header` name (case-insensitive) to allow replacing that header's existing value; any other name has no effect. Everything else keeps the "never overwrite" rule. Some official providers hard-code placeholder values (e.g. `dsh-web-search-deepseek` sends `x-opencode-session: dsh-web-search`), which gateways reject as missing; to replace that placeholder, set that header's name as this plugin's header too — e.g. `header: x-opencode-session` with `overwriteHeaders: [x-opencode-session]` — so the live session id replaces it. |
 
 ## Verify it
 
@@ -75,7 +75,7 @@ Every request of the same conversation carries the same id; a spawned subagent's
 
 ## Notes
 
-- The `llm-deepseek` adapter already sends its own `x-deepseek-harness-session-id` on every request; this plugin is provider-neutral and intentional about not overwriting existing headers.
+- The `llm-deepseek` adapter already sends its own `x-deepseek-harness-session-id` on every request; this plugin is provider-neutral and never overwrites an existing header by default — only when `overwriteHeaders` explicitly lists this plugin's own header is the existing value replaced.
 - `attributionHeaders()` (the harness User-Agent attribution contract) is never touched.
 - Concurrent sessions are handled correctly: the header value is resolved per call through AsyncLocalStorage, not through shared mutable state.
 
