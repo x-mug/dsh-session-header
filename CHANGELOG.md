@@ -9,6 +9,8 @@ Forked from [`homily707/dsh-session-header`](https://github.com/homily707/dsh-se
 
 ### Fixed
 
+- Require and lock `@deepseek-ai/schemastery` 3.18.5 or newer: the previous
+  locked version lacked `.volatile()` and caused the plugin to fail on import.
 - The settings status panel no longer shows "未知" for the plugin state and the
   injected header name. Both rows read data the Host actually publishes: the
   plugin state comes from `pluginInventory` (active / disabled / failed), and
