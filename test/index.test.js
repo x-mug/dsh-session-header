@@ -1101,10 +1101,69 @@ test('guards: enabled=false installs nothing but keeps the schema loaded', () =>
     assert.equal(defaults.enabled, true)
     // Volatile fields parse into live references, read through .get().
     assert.equal(defaults.nativeHeaderSeen.get(), false)
+    assert.equal(defaults.header.get(), 'x-session-id')
     assert.equal(defaults.nativeSessionHeaders.length, 8)
   } finally {
     recorder.restore()
   }
+})
+
+test('guards: a live header rename applies to the next request', async (t) => {
+  const recorder = installFetchRecorder()
+  const { ctx, handlers, disposers, infos } = makeContext()
+  const config = Config({})
+  apply(ctx, config)
+  t.after(() => {
+    for (const dispose of disposers) dispose?.()
+    recorder.restore()
+  })
+  async function* firstRequest() {
+    await fetch('https://llm.example.com/v1/chat')
+    yield 'chunk'
+  }
+  const first = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => firstRequest())
+  for await (const _ of first) { /* drain */ }
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  // The Loader commits a volatile edit into the live reference; replacing the
+  // reference itself is equivalent from apply()'s point of view.
+  config.header = { get: () => 'x-live-session' }
+  async function* secondRequest() {
+    await fetch('https://llm.example.com/v1/chat')
+    yield 'chunk'
+  }
+  const second = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => secondRequest())
+  for await (const _ of second) { /* drain */ }
+  assert.equal(recorder.calls[1].headers.get('x-live-session'), 'abc')
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+  assert.equal(infos.filter((line) => /header renamed to/.test(line)).length, 1)
+})
+
+test('guards: an unusable live header fails closed until it is fixed', async (t) => {
+  const recorder = installFetchRecorder()
+  const { ctx, handlers, disposers, errors } = makeContext()
+  const config = Config({})
+  apply(ctx, config)
+  t.after(() => {
+    for (const dispose of disposers) dispose?.()
+    recorder.restore()
+  })
+  config.header = { get: () => 'bad header name' }
+  async function* broken() {
+    await fetch('https://llm.example.com/v1/chat')
+    yield 'chunk'
+  }
+  const first = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => broken())
+  for await (const _ of first) { /* drain */ }
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), null)
+  assert.equal(errors.filter((line) => /unusable live header change/.test(line)).length, 1)
+  config.header = { get: () => 'x-session-id' }
+  async function* fixed() {
+    await fetch('https://llm.example.com/v1/chat')
+    yield 'chunk'
+  }
+  const second = handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => fixed())
+  for await (const _ of second) { /* drain */ }
+  assert.equal(recorder.calls[1].headers.get('x-session-id'), 'abc')
 })
 
 test('guards: an existing native session header stops injection and logs once', async (t) => {

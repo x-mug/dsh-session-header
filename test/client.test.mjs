@@ -106,11 +106,20 @@ const describeWith = (entryValue) => ({
   }
 })
 
+/** One `pluginInventory.list` snapshot holding the given rows. */
+const inventoryWith = (entries) => ({
+  ok: true,
+  value: { entries, agentPresets: [] }
+})
+
 /** A Cordis-shaped context that records slot registrations. */
-const createContext = (describe) => {
+const createContext = (describe, inventory) => {
   const registrations = []
   const disposers = []
   const ctx = {
+    inject: (_names, callback) => {
+      callback(ctx)
+    },
     effect: (callback) => {
       const disposer = callback()
       if (typeof disposer === 'function') disposers.push(disposer)
@@ -135,7 +144,10 @@ const createContext = (describe) => {
     get: () => undefined,
     remote: {
       $on: () => () => {},
-      settings: { describe }
+      settings: { describe },
+      pluginInventory: {
+        list: async () => inventory ?? inventoryWith([])
+      }
     }
   }
   return { ctx, registrations, disposers }
@@ -174,6 +186,65 @@ test('browser bundle: apply offers both surfaces', async () => {
   assert.equal(overlay.entry.id, 'dsh-session-header.native-notice')
   assert.equal(section.entry.id, 'dsh-session-header')
   assert.ok(overlay.entry.order < section.entry.order, 'the banner sorts before the settings row')
+})
+
+test('browser bundle: the status row shows the live plugin state and header', async () => {
+  const factory = factories.get('dsh-session-header')
+  const { ctx, registrations } = createContext(
+    async () => describeWith({ header: 'x-session-id', nativeHeaderSeen: false }),
+    inventoryWith([{ entryId: 'session-header', enabled: true, fiberPhase: 'active', meta: { title: 'Session header' } }])
+  )
+  factory(requirePlatform).apply(ctx)
+  await settle()
+
+  const section = slotOf(registrations, 'settings.section')
+  const copy = texts(section.component(section.entry.inject()))
+  assert.match(copy, /启用/)
+  assert.match(copy, /x-session-id/)
+  assert.doesNotMatch(copy, /未知/)
+})
+
+test('browser bundle: a disabled plugin reports its inventory state', async () => {
+  const factory = factories.get('dsh-session-header')
+  const { ctx, registrations } = createContext(
+    async () => ({ ok: true, value: { namespaces: [] } }),
+    inventoryWith([{ entryId: 'session-header', enabled: false, fiberPhase: null }])
+  )
+  factory(requirePlatform).apply(ctx)
+  await settle()
+
+  const section = slotOf(registrations, 'settings.section')
+  const copy = texts(section.component(section.entry.inject()))
+  assert.match(copy, /已关闭/)
+  assert.doesNotMatch(copy, /没有注册/)
+})
+
+test('browser bundle: a failed fiber is reported instead of a generic unknown', async () => {
+  const factory = factories.get('dsh-session-header')
+  const { ctx, registrations } = createContext(
+    async () => ({ ok: true, value: { namespaces: [] } }),
+    inventoryWith([{ entryId: 'session-header', enabled: true, fiberPhase: 'failed' }])
+  )
+  factory(requirePlatform).apply(ctx)
+  await settle()
+
+  const section = slotOf(registrations, 'settings.section')
+  assert.match(texts(section.component(section.entry.inject())), /加载失败/)
+})
+
+test('browser bundle: a broken inventory call keeps the form-derived state', async () => {
+  const factory = factories.get('dsh-session-header')
+  const { ctx, registrations } = createContext(
+    async () => describeWith({ header: 'x-session-id' }),
+    { ok: false, error: { code: 'gateway/internal', message: 'inventory down' } }
+  )
+  factory(requirePlatform).apply(ctx)
+  await settle()
+
+  const section = slotOf(registrations, 'settings.section')
+  const copy = texts(section.component(section.entry.inject()))
+  assert.match(copy, /启用/)
+  assert.match(copy, /x-session-id/)
 })
 
 test('browser bundle: a native sighting raises the one-time notice', async () => {

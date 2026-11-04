@@ -61,7 +61,7 @@ dsh --patch ./my-overlay.yml
 | 字段 | 类型 | 默认 | 含义 |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | 总开关。`false` 时不安装任何东西——无 fetch hook、无监听器——但 schema 仍加载，便于设置界面关掉或重开。 |
-| `header` | string | `x-session-id` | 注入的 header 名；线上大小写不敏感 |
+| `header` | string（volatile） | `x-session-id` | 注入的 header 名；线上大小写不敏感。volatile 是为了让设置页读到实际生效的名字（设置服务只暴露 volatile 字段）；在配置里活改会在下一次请求前重新校验并生效，非法名字会让注入暂停并报错。 |
 | `value` | string | — | 固定值；不设 = 取当前调用的 harness session id |
 | `reviewSessionPrefix` | string | `auto-review:` | 辅助调用合成 id 的前缀。以此开头的调用改为发送 `<前缀>session-<发起会话 uuid>`——仍是自己的身份与账目，但能追溯到所属会话。空字符串关闭该改写。 |
 | `toolEndpoints` | string[] | `[]` | 工具执行期匹配的 URL 前缀。非空时，`tools/execute` 瀑布内的 fetch（例如工具里调用的网关 web-search Messages API）仅当 URL 以某前缀开头才注入 header——第三方工具目标（web_fetch 抓任意网页、GitHub、MCP 服务器等）不受影响。前缀解析出的路径为 `/` 时等于放行整个 origin，该 origin 下所有路径都会带上 session id。默认空 = 保持原有仅 LLM 注入行为 |
@@ -70,6 +70,8 @@ dsh --patch ./my-overlay.yml
 | `redirectGuard` | boolean | `false` | 开启后，本插件实际注入 header 的请求会带上 `redirect: 'error'`，避免 header 跟随重定向跳到别的 origin——fetch 跨源重定向会剥掉凭据，但不会剥掉自定义 header。仅当调用方通过 `init.redirect` 显式指定时保留其值；`Request` 形态下非默认的 `redirect`（如 `manual`）会保留，但默认的 `follow` 会被改成 `error`。默认关闭，不开启则不改变任何现有行为。 |
 | `nativeSessionHeaders` | string[] | 8 个生态头名 | 表示「本请求已带会话身份」的 header 名：x-session-id、x-opencode-session、x-session-affinity、session_id、session-id、x-claude-code-session-id、x-conversation-id、x-deepseek-harness-session-id。大小写不敏感；命中即不注入并计入 native skip。本插件自己的 `header` 名不计入，避免本插件的两个实例互相 stand-down。 |
 | `nativeHeaderSeen` | boolean（volatile） | `false` | 由宿主写入：首次检测到原生会话头时置 true，客户端插件据此提示卸载本冗余插件。 |
+
+设置页的状态区显示运行状态（来自宿主 `pluginInventory`：启用 / 关闭 / 加载失败）、实际注入的 header 名和原生会话头检测结果。`enabled` 仍然是普通字段，改动它需要重载插件；只有 `header` 与 `nativeHeaderSeen` 是 volatile。
 
 注意两个列表的空值语义相反：`toolEndpoints` 为空会关掉工具阶段注入，而 `llmEndpointAllowlist` 为空表示「不限制」——这是向后兼容的默认值，建议显式开启限制。前缀路径写成 `/` 等于覆盖整个 origin（同域的 OAuth token 端点也会命中），要排除就必须写具体路径前缀。`redirectGuard` 未开启时不改变任何行为；开启后也只作用于真正被注入、且调用方没有自行指定重定向策略的请求。请求若已带 `nativeSessionHeaders` 中任一头，本插件不再插手：计入 native skip、只记一次日志，并只通过 settings 服务写一次 `nativeHeaderSeen`（写失败仅告警）。计数器 `injected` 与 `nativeSkipped` 在每类首次事件与每 100 次请求时输出一条汇总；`fallback` 失败走按错误签名限流的 warn，不输出汇总。
 

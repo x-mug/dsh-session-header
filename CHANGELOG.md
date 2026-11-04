@@ -5,6 +5,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 Forked from [`homily707/dsh-session-header`](https://github.com/homily707/dsh-session-header) at `79a96e6` (0.2.1).
 
+## [Unreleased]
+
+### Fixed
+
+- The settings status panel no longer shows "未知" for the plugin state and the
+  injected header name. Both rows read data the Host actually publishes: the
+  plugin state comes from `pluginInventory` (active / disabled / failed), and
+  `header` is now a volatile config field, which is the only kind the settings
+  service exposes to a panel. Previously the panel read `enabled` and `header`
+  from a form that deliberately projects volatile fields only, so those two
+  values were always undefined.
+- A live `header` edit — in the config document or through the settings
+  service — is now re-validated and applies to the next request. An unusable
+  new name stops injection with an error until it is fixed, instead of being
+  written to the wire or silently ignored.
+- Opening the settings section re-reads both sources, so a fiber that failed
+  after the page loaded no longer leaves stale rows behind.
+
 ## [0.4.3] - 2026-10-30
 
 ### Added

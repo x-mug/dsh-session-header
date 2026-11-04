@@ -79,9 +79,12 @@ export const Config = Schema.object({
    * Header name to inject; HTTP field names are case-insensitive on the wire.
    * An invalid field name, or a credential/routing/framing header, rejects the
    * configuration at apply time — logged, then thrown, so the plugin shows up
-   * as failed instead of loading healthy and never injecting.
+   * as failed instead of loading healthy and never injecting. Volatile so the
+   * settings page can read the effective name: the settings service exposes
+   * only volatile fields, and a live edit then renames the header for the next
+   * request without remounting the plugin.
    */
-  header: Schema.string().default('x-session-id'),
+  header: Schema.string().default('x-session-id').volatile(),
   /**
    * Fixed header value. Unset means "use the harness session id of the call
    * in flight" (`GenerateOptions.sessionId`); calls with neither get no header.
@@ -414,16 +417,27 @@ export function unregister(id, logger) {
  */
 export function apply(ctx, config) {
   // The Schema above already filled the defaults (the harness validates plugin
-  // config through it), so these are read once here rather than re-defaulted on
-  // every injection.
-  const { enabled, nativeSessionHeaders, header, value: fixedValue, reviewSessionPrefix, llmEndpointAllowlist, toolEndpoints, overwriteHeaders, redirectGuard } = config
+  // config through it), so ordinary fields are read once here rather than
+  // re-defaulted on every injection. `header` is the exception: it is volatile
+  // (see Config), read through `headerValue()` below so a live edit applies to
+  // the next request.
+  const { enabled, nativeSessionHeaders, value: fixedValue, reviewSessionPrefix, llmEndpointAllowlist, toolEndpoints, overwriteHeaders, redirectGuard } = config
+
+  /** Current header name from the volatile reference, or undefined when unusable. */
+  const headerValue = () => {
+    const ref = config.header
+    const value = typeof ref?.get === 'function' ? ref.get() : ref
+    return typeof value === 'string' ? value : undefined
+  }
+  let observedHeader = headerValue()
+  let activeHeader = observedHeader
 
   // Fail closed BEFORE any global side effect: nothing is patched and no
   // listener is registered, so a rejected config cannot degrade requests. Log
   // first, then throw: Cordis catches an apply() rejection and marks the fiber
   // failed, which is exactly the state an operator needs to see — a silent
   // return would leave the plugin looking healthy while doing nothing.
-  const problem = configDiagnostic(header, fixedValue, llmEndpointAllowlist)
+  const problem = configDiagnostic(activeHeader, fixedValue, llmEndpointAllowlist)
   if (problem !== undefined) {
     ctx.logger.error(`dsh-session-header: not installing — ${problem}`)
     throw new Error(`dsh-session-header: ${problem}`)
@@ -436,10 +450,27 @@ export function apply(ctx, config) {
     return
   }
 
+  /**
+   * The validated header to use for one request. A live edit of the volatile
+   * field is re-validated the first time it is seen; an unusable new name stops
+   * injection until it is fixed, rather than writing a malformed field.
+   */
+  const readHeader = () => {
+    const next = headerValue()
+    if (next === observedHeader) return activeHeader
+    observedHeader = next
+    const issue = configDiagnostic(next, fixedValue, llmEndpointAllowlist)
+    if (issue === undefined) {
+      activeHeader = next
+      ctx.logger.info?.(`dsh-session-header: header renamed to "${next}" by a live config edit`)
+    } else {
+      activeHeader = undefined
+      ctx.logger.error(`dsh-session-header: ignoring an unusable live header change: ${issue}`)
+    }
+    return activeHeader
+  }
+
   const als = new AsyncLocalStorage()
-  // Only one question is ever asked of `overwriteHeaders`: may we replace OUR
-  // header? Case-insensitive match, the same rule the wire uses.
-  const mayOverwrite = overwriteHeaders.some((name) => name.toLowerCase() === header.toLowerCase())
 
   // Compile configured URL prefixes into origin-anchored matchers so a
   // whitelist can never match a sibling domain: `https://gateway.example.com`
@@ -610,6 +641,10 @@ export function apply(ctx, config) {
       ) {
         return undefined
       }
+      // Read the live (volatile) header name once per request; undefined means
+      // the configuration is currently unusable, so fail closed.
+      const header = readHeader()
+      if (header === undefined) return undefined
       // Collect headers from both fetch() spellings: a Request object carries
       // its own, and init.headers overrides them per the fetch standard.
       const headers = new Headers(input instanceof Request ? input.headers : undefined)
@@ -632,7 +667,9 @@ export function apply(ctx, config) {
       }
       // Inject only when absent — unless `overwriteHeaders` lists our header, in
       // which case the live session id replaces whatever placeholder value
-      // another layer (an official provider) hard-coded.
+      // another layer (an official provider) hard-coded. Case-insensitive match,
+      // the same rule the wire uses.
+      const mayOverwrite = overwriteHeaders.some((name) => name.toLowerCase() === header.toLowerCase())
       if (headers.has(header) && !mayOverwrite) return undefined
       headers.set(header, injection.value)
       // Optional guard: fetch strips credentials on a cross-origin redirect but

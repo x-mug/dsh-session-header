@@ -57,6 +57,10 @@ window.__ModuleLoader__.load({
         statusNativeYes: '已检测到',
         statusNativeNo: '未检测到',
         statusHeader: '注入的请求头',
+        statusEnabledFailed: '加载失败',
+        statusEnabledLoading: '加载中',
+        statusUnloading: '卸载中',
+        statusNotLoaded: '未加载',
         statusUnknown: '未知',
         uninstallHint: '建议卸载：本插件已经多余。在终端执行 dsh plugin remove dsh-session-header，或在「设置 → 插件」里关掉它。',
         showAgain: '重新显示提示',
@@ -80,6 +84,10 @@ window.__ModuleLoader__.load({
         statusNativeYes: 'detected',
         statusNativeNo: 'not detected',
         statusHeader: 'Injected header',
+        statusEnabledFailed: 'failed to load',
+        statusEnabledLoading: 'loading',
+        statusUnloading: 'unloading',
+        statusNotLoaded: 'not loaded',
         statusUnknown: 'unknown',
         uninstallHint: 'Safe to uninstall: the plugin is redundant. Run dsh plugin remove dsh-session-header, or turn it off under Settings → Plugins.',
         showAgain: 'Show the notice again',
@@ -155,6 +163,23 @@ window.__ModuleLoader__.load({
       return rows.find((row) => typeof row?.ns === 'string' && /(^|[./:_-])session-header$/.test(row.ns))
     }
 
+    /** This plugin's inventory row: exact entry ids first, then a suffix match. */
+    const matchInventoryEntry = (snapshot) => {
+      const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : []
+      const exact = entries.find((row) => row !== null && typeof row === 'object' && ENTRY_IDS.includes(row.entryId))
+      if (exact !== undefined) return exact
+      return entries.find((row) => typeof row?.entryId === 'string' && /(^|[./:_-])session-header$/.test(row.entryId))
+    }
+
+    /** Read `pluginInventory.list()` as a plain snapshot; failures stay silent. */
+    const inventoryOf = async (remote) => {
+      try {
+        return unwrap(await remote.list())
+      } catch {
+        return undefined
+      }
+    }
+
     /** Effective field values: the live value with the user layer folded over it. */
     const fieldsOf = (entry) => {
       const value = entry?.value !== null && typeof entry?.value === 'object' ? entry.value : {}
@@ -183,6 +208,7 @@ window.__ModuleLoader__.load({
         seen: false,
         seenKey: undefined,
         enabled: undefined,
+        phase: undefined,
         header: undefined,
         ns: undefined,
         error: undefined,
@@ -362,6 +388,19 @@ window.__ModuleLoader__.load({
           }, props.t('noticeAck'))))
     }
 
+    /** Human status for the inventory row, falling back to the form's presence. */
+    const enabledState = (snapshot, t) => {
+      if (snapshot.enabled === false) return t('statusEnabledOff')
+      if (snapshot.phase === 'failed') return t('statusEnabledFailed')
+      if (snapshot.phase === 'active') return t('statusEnabledOn')
+      if (snapshot.phase === 'loading' || snapshot.phase === 'pending') return t('statusEnabledLoading')
+      if (snapshot.phase === 'unloading') return t('statusUnloading')
+      if (snapshot.phase === null) return t('statusNotLoaded')
+      // A settings form only exists for an active fiber, so its presence is the
+      // best evidence the plugin is mounted when the inventory is unavailable.
+      return snapshot.status === 'ready' ? t('statusEnabledOn') : t('statusUnknown')
+    }
+
     /** The durable status row; survives the dismissed banner. */
     const StatusSection = (props) => {
       const snapshot = props.useSnapshot()
@@ -370,9 +409,12 @@ window.__ModuleLoader__.load({
       const nativeText = snapshot.seen
         ? props.t('statusNativeYes') + (snapshot.seenKey === undefined ? '' : ' (' + snapshot.seenKey + ')')
         : (snapshot.status === 'missing' ? props.t('statusUnknown') : props.t('statusNativeNo'))
-      const enabledText = snapshot.enabled === undefined
-        ? props.t('statusUnknown')
-        : (snapshot.enabled ? props.t('statusEnabledOn') : props.t('statusEnabledOff'))
+      const enabledText = enabledState(snapshot, props.t)
+      // Opening the settings page is also a re-read: the inventory has no
+      // change event, and a fiber failure would otherwise keep stale rows.
+      react.useEffect(() => {
+        props.refresh?.()
+      }, [])
       return h('div', { style: S.card },
         h('h3', { style: S.title }, props.t('sectionTitle')),
         h('p', { style: S.subtitle }, props.t('sectionSubtitle')),
@@ -385,7 +427,9 @@ window.__ModuleLoader__.load({
         h('div', { style: S.row },
           h('span', { style: S.rowLabel }, props.t('statusHeader')),
           h('span', { style: S.rowValue }, value(snapshot.header, props.t('statusUnknown')))),
-        snapshot.status === 'missing' ? h('p', { style: S.status }, props.t('notRegistered')) : null,
+        snapshot.status === 'missing' && snapshot.phase === undefined
+          ? h('p', { style: S.status }, props.t('notRegistered'))
+          : null,
         snapshot.status === 'error'
           ? h('p', { style: S.status }, props.t('readFailed', { message: String(snapshot.error) }))
           : null,
@@ -436,30 +480,35 @@ window.__ModuleLoader__.load({
       const useSnapshot = makeUseSnapshot(store)
       let generation = 0
       let scheduled = false
+      /** The optional inventory remote; resolved once the Host exposes it. */
+      let inventory
 
-      /** Read the host fact once; an answer overtaken by a newer read is dropped. */
+      /** Read the host facts once; an answer overtaken by a newer read is dropped. */
       const refresh = () => {
         const mine = ++generation
         return Promise.resolve()
-          .then(() => ctx.remote.settings.describe())
-          .then((raw) => {
+          .then(() => Promise.all([
+            ctx.remote.settings.describe(),
+            inventory === undefined ? undefined : inventoryOf(inventory)
+          ]))
+          .then(([raw, inventorySnapshot]) => {
             if (mine !== generation) return
             const entry = matchEntry(namespaceRows(raw))
-            if (entry === undefined) {
-              store.set({ status: 'missing', seen: false, seenKey: undefined, raw: unwrap(raw) })
-              return
-            }
-            const fields = fieldsOf(entry)
+            const inventoryEntry = matchInventoryEntry(inventorySnapshot)
+            const fields = entry === undefined ? {} : fieldsOf(entry)
             const native = detectNative(fields)
             store.set({
-              status: 'ready',
-              ns: entry.ns,
+              status: entry === undefined ? 'missing' : 'ready',
+              ns: entry?.ns,
               seen: native.seen,
               seenKey: native.key,
-              enabled: typeof fields.enabled === 'boolean' ? fields.enabled : undefined,
+              enabled: inventoryEntry !== undefined && typeof inventoryEntry.enabled === 'boolean'
+                ? inventoryEntry.enabled
+                : undefined,
+              phase: inventoryEntry === undefined ? undefined : inventoryEntry.fiberPhase,
               header: typeof fields.header === 'string' ? fields.header : undefined,
               error: undefined,
-              raw: { entry, fields }
+              raw: { entry, inventory: inventoryEntry }
             })
           })
           .catch((error) => {
@@ -488,6 +537,15 @@ window.__ModuleLoader__.load({
         schedule()
       }
 
+      // Inventory is optional: without it the panel still shows the form data,
+      // and a form row's presence still means the plugin's fiber is active.
+      if (typeof ctx.inject === 'function') {
+        ctx.inject(['remote.pluginInventory'], () => {
+          inventory = ctx.remote?.pluginInventory
+          schedule()
+        })
+      }
+
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay',
         id: 'dsh-session-header.native-notice',
@@ -501,7 +559,7 @@ window.__ModuleLoader__.load({
         id: 'dsh-session-header',
         order: 70,
         label: () => translate('sectionLabel'),
-        inject: () => ({ t: translate, restore, useSnapshot })
+        inject: () => ({ t: translate, restore, refresh: schedule, useSnapshot })
       }, StatusSection), 'dsh-session-header: status section')
 
       ctx.effect(() => {
