@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.28.5'
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify plugin
+        shell: bash
+        run: |
+          node --check index.js
+          node --check client.js
+          node --test --test-isolation=none test/*.test.*
+      - name: Pack and verify contents
+        shell: bash
+        run: |
+          mkdir -p dist
+          npm pack --ignore-scripts --pack-destination dist
+          tar -tzf dist/*.tgz > dist/contents.txt
+          node -e "const fs=require('node:fs'); const entries=fs.readFileSync('dist/contents.txt','utf8').split(/\r?\n/); for (const f of ['package.json','index.js','client.js','cordis.patch.yml','README.md','icon.svg','locale/zh.json','locale/en.json']) { if (!entries.includes('package/'+f)) { console.error('Missing '+f); process.exit(1); } }"
